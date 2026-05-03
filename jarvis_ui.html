@@ -746,32 +746,24 @@ function stopWakeListener() {
   }
 }
 
+const QUESTION_WINDOW_MS = 12000;
+
 function captureQuestionAfterWake() {
   if (questionRecognition) return;
   setState(STATE.LISTENING);
   const q = new SR();
   q.lang = "ko-KR";
-  q.continuous = false;
+  q.continuous = true;
   q.interimResults = true;
   q.maxAlternatives = 1;
   let live = log("LISTENING...", "live");
   let final = "";
-  q.onresult = (ev) => {
-    let f = "", interim = "";
-    for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const t = ev.results[i][0].transcript || "";
-      if (ev.results[i].isFinal) f += t;
-      else interim += t;
-    }
-    if (live) live.textContent = "LISTENING: " + (f || interim);
-    if (f.trim()) final = f.trim();
-  };
-  q.onerror = (ev) => {
-    if (ev.error !== "no-speech" && ev.error !== "aborted") {
-      log("STT ERROR: " + ev.error, "error");
-    }
-  };
-  q.onend = () => {
+  let resolved = false;
+  const stopAndDispatch = () => {
+    if (resolved) return;
+    resolved = true;
+    clearTimeout(timer);
+    try { q.abort(); } catch {}
     questionRecognition = null;
     if (final && final.length >= 2) {
       handleQuery(final);
@@ -780,6 +772,28 @@ function captureQuestionAfterWake() {
       setState(STATE.IDLE);
       if (wakeMode) startWakeListener();
     }
+  };
+  const timer = setTimeout(stopAndDispatch, QUESTION_WINDOW_MS);
+  q.onresult = (ev) => {
+    let f = "", interim = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const t = ev.results[i][0].transcript || "";
+      if (ev.results[i].isFinal) f += t;
+      else interim += t;
+    }
+    if (live) live.textContent = "LISTENING: " + (f || interim);
+    if (f.trim()) {
+      final = f.trim();
+      stopAndDispatch();
+    }
+  };
+  q.onerror = (ev) => {
+    if (ev.error !== "no-speech" && ev.error !== "aborted") {
+      log("STT ERROR: " + ev.error, "error");
+    }
+  };
+  q.onend = () => {
+    if (!resolved) stopAndDispatch();
   };
   try {
     q.start();
@@ -799,7 +813,7 @@ function updateWakeUI() {
 // After the assistant finishes answering, leave a short window open so the
 // user can ask a follow-up without re-saying "자비스". Resolves to the
 // transcribed string, or null if the window times out without speech.
-const FOLLOWUP_WINDOW_MS = 8000;
+const FOLLOWUP_WINDOW_MS = 12000;
 let followupRecognition = null;
 let followupAbort = false;
 
@@ -820,7 +834,7 @@ function captureFollowupText() {
     const live = log("FOLLOWUP — 듣고 있어요", "live");
     const q = new SR();
     q.lang = "ko-KR";
-    q.continuous = false;
+    q.continuous = true;
     q.interimResults = true;
     q.maxAlternatives = 1;
     let final = "";
@@ -844,10 +858,15 @@ function captureFollowupText() {
         else interim += t;
       }
       if (live) live.textContent = "FOLLOWUP: " + (f || interim);
-      if (f.trim()) final = f.trim();
+      if (f.trim()) {
+        final = f.trim();
+        finish(final);
+      }
     };
-    q.onerror = () => {
-      finish(final && final.length >= 2 ? final : null);
+    q.onerror = (ev) => {
+      if (ev.error !== "no-speech" && ev.error !== "aborted") {
+        log("FOLLOWUP STT ERROR: " + ev.error, "error");
+      }
     };
     q.onend = () => {
       if (followupAbort) finish(null);
