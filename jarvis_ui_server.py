@@ -358,6 +358,122 @@ async def fetch_lotto_for(text: str) -> tuple[str, str]:
     return str(rnd or ""), summary
 
 
+# ── Running / Marathon ─────────────────────────────────────────────────
+RUNNING_KEYWORDS = (
+    "러닝", "달리기", "조깅", "마라톤", "풀코스", "하프코스", "하프 코스",
+    "페이스", "주행거리", "러닝코스", "러닝 코스", "달리기코스", "달리기 코스",
+    "마라톤대회", "마라톤 대회", "10k 대회", "10km 대회", "5k 대회", "하프 마라톤",
+)
+
+# Named distances (km). Order matters: longest keys first to avoid '하프'
+# accidentally matching inside '하프코스' before we resolve the longer name.
+_DIST_NAMED: dict[str, float] = {
+    "풀코스": 42.195, "풀 코스": 42.195,
+    "하프코스": 21.0975, "하프 코스": 21.0975,
+    "10키로": 10.0, "10킬로": 10.0,
+    "5키로": 5.0, "5킬로": 5.0,
+    "3키로": 3.0, "3킬로": 3.0,
+    "하프": 21.0975,
+    "풀": 42.195,
+}
+
+
+def needs_running(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(k in t for k in RUNNING_KEYWORDS)
+
+
+def _parse_distance_km(text: str) -> float | None:
+    t = text.lower()
+    for name, km in _DIST_NAMED.items():
+        if name in t:
+            return km
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:km|킬로미터|키로미터|킬로|키로|k\b|케이\b)", t)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _parse_time_seconds(text: str) -> int | None:
+    """'1시간 30분 25초' / '90분' / '25분 30초' / '1:30:25' / '25:00'."""
+    t = text.replace(" ", "")
+    m = re.search(r"(\d+)시간(?:(\d+)분)?(?:(\d+)초)?", t)
+    if m:
+        h = int(m.group(1))
+        mi = int(m.group(2) or 0)
+        s = int(m.group(3) or 0)
+        return h * 3600 + mi * 60 + s
+    m = re.search(r"(\d+)분(?:(\d+)초)?", t)
+    if m and "시간" not in t:
+        return int(m.group(1)) * 60 + int(m.group(2) or 0)
+    m = re.search(r"\b(\d+):(\d{1,2}):(\d{1,2})\b", t)
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+    m = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    return None
+
+
+def _parse_pace_sec_per_km(text: str) -> int | None:
+    """'페이스 5분', '페이스 4분 30초', '4:30 페이스', '5분 페이스'."""
+    m = re.search(r"페이스\s*(\d+)\s*분(?:\s*(\d+)\s*초)?", text)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2) or 0)
+    m = re.search(r"(\d+)\s*분(?:\s*(\d+)\s*초)?\s*페이스", text)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2) or 0)
+    m = re.search(r"페이스\s*(\d+):(\d{1,2})", text)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    return None
+
+
+def _fmt_pace(sec_per_km: float) -> str:
+    s = int(round(sec_per_km))
+    return f"{s // 60}분 {s % 60:02d}초/km"
+
+
+def _fmt_dur(seconds: float) -> str:
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}시간 {m}분 {s}초"
+    return f"{m}분 {s}초"
+
+
+def compute_running(text: str) -> str | None:
+    """Try distance/time/pace math from the user's text. Returns a formatted
+    summary or None if not enough info to compute."""
+    km = _parse_distance_km(text)
+    sec = _parse_time_seconds(text)
+    pace = _parse_pace_sec_per_km(text)
+    # Prefer pace match over generic '5분' that the time parser would catch.
+    if pace and sec and pace == sec:
+        sec = None
+    if km and sec and not pace:
+        pace_calc = sec / km
+        speed_kmh = km / (sec / 3600)
+        return (
+            f"{km}km를 {_fmt_dur(sec)}에 뛰면 페이스는 {_fmt_pace(pace_calc)}, "
+            f"평균 속도는 {speed_kmh:.2f} km/h입니다."
+        )
+    if km and pace and not sec:
+        sec_calc = km * pace
+        return (
+            f"{km}km를 페이스 {_fmt_pace(pace)}로 뛰면 약 {_fmt_dur(sec_calc)} 걸립니다."
+        )
+    if sec and pace and not km:
+        km_calc = sec / pace
+        return (
+            f"{_fmt_dur(sec)} 동안 페이스 {_fmt_pace(pace)}로 뛰면 약 {km_calc:.2f}km 갑니다."
+        )
+    return None
+
+
 SEARCH_RESULTS = 8
 FETCH_TOP_N = 3
 FETCH_MAX_CHARS = 1800
@@ -514,6 +630,33 @@ async def chat(req: Request) -> StreamingResponse:
                     "마크다운 없이 한 단락, 두 문장 이내. 번호는 콤마로 자연스럽게 읽도록 적으세요.",
                     summary,
                 )
+            elif needs_running(last_user):
+                # Two sub-modes: deterministic pace math (no network) or
+                # web search for marathon events / running courses.
+                pace_summary = compute_running(last_user)
+                if pace_summary is not None:
+                    yield _ndjson({"_progress": "RUNNING PACE CALC"})
+                    yield _ndjson({"_progress": pace_summary[:80]})
+                    injected = (
+                        "다음은 러닝 페이스/시간/거리 계산 결과입니다. "
+                        "이 값을 그대로 한 문장으로 자연스럽게 전달하세요. 마크다운 금지.",
+                        pace_summary,
+                    )
+                else:
+                    yield _ndjson({"_progress": f"RUNNING SEARCH: {last_user}"})
+                    try:
+                        results = await web_search(last_user)
+                    except Exception as exc:
+                        yield _ndjson({"_progress": f"SEARCH ERROR: {exc}"})
+                        results = ""
+                    if results:
+                        preview = results.splitlines()[0][:80]
+                        yield _ndjson({"_progress": f"RESULTS: {preview}"})
+                        injected = (
+                            "다음은 러닝/마라톤 관련 검색 결과입니다. "
+                            "이 정보만 근거로 핵심만 한 문장으로 답하세요. 마크다운 금지.",
+                            results,
+                        )
             elif needs_realtime(last_user):
                 yield _ndjson({"_progress": f"WEB SEARCH: {last_user}"})
                 try:
