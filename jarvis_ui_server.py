@@ -62,6 +62,35 @@ def needs_realtime(user_text: str) -> bool:
     return False
 
 
+# Social / small-talk phrases that contain temporal words like "오늘"
+# but should NOT trigger web search — let the LLM answer conversationally.
+SOCIAL_PHRASES = (
+    # greetings / farewells
+    "안녕", "잘 가", "잘가", "잘 지내", "잘지내", "어서와", "반가",
+    # gratitude / praise / apology
+    "고마워", "감사", "천만에", "별말", "미안", "죄송", "잘했",
+    "똑똑", "대단", "최고", "멋있",
+    # state-of-being chitchat
+    "기분", "심심", "재밌", "재미없", "심심해", "보고 싶", "보고싶", "사랑",
+    "어떻게 지내", "잘 있", "잘있",
+    # acknowledgments
+    "응", "그래", "맞아", "맞다", "정말", "진짜", "그렇구나", "오케이", "ok",
+    "알겠", "알았",
+    # generic chat
+    "농담", "웃겨", "재밌는 얘기",
+)
+
+
+def is_social_chat(user_text: str) -> bool:
+    if not user_text:
+        return False
+    t = user_text.replace(" ", "").lower()
+    for p in SOCIAL_PHRASES:
+        if p.replace(" ", "").lower() in t:
+            return True
+    return False
+
+
 # ── KBO baseball domain handler ─────────────────────────────────────────
 KBO_KEYWORDS = (
     "야구", "kbo", "프로야구", "프로 야구",
@@ -662,7 +691,11 @@ async def chat(req: Request) -> StreamingResponse:
             return
 
         injected = None  # tuple (label, content) when a domain handler ran
-        if search_enabled and last_user:
+        # Social / small-talk bypasses every search/domain branch — let the
+        # LLM answer conversationally to greetings, gratitude, banter, etc.
+        if last_user and is_social_chat(last_user):
+            yield _ndjson({"_progress": "SOCIAL CHAT"})
+        elif search_enabled and last_user:
             if needs_kbo(last_user):
                 yield _ndjson({"_progress": "KBO SCHEDULE LOOKUP"})
                 date_str, summary = await fetch_kbo_for(last_user)
@@ -782,26 +815,38 @@ async def chat(req: Request) -> StreamingResponse:
             final = (r.json().get("message", {}).get("content") or "").strip()
 
             # Defensive retry: q3 14B occasionally leaks Chinese characters
-            # mid-Korean. One re-roll with an explicit Hanja-ban prompt.
-            if has_hanzi(final):
+            # mid-Korean. Up to two re-rolls with progressively stricter
+            # Hanja-ban prompts. As a last resort, strip the Hanja itself.
+            retry_prompts = [
+                "방금 답변에 한자(중국어 글자)가 섞였습니다. 의미는 그대로 두고 한자 부분만 한글로 바꿔서 똑같이 짧게 다시 답해주세요. 마크다운/줄바꿈 없이 한 단락으로.",
+                "다시 한자가 섞였습니다. 한자(漢字)와 중국어를 절대 사용하지 마세요. 오직 한글 자모와 숫자, 영어 알파벳만 사용해서 같은 의미로 한 문장만 다시 써주세요.",
+            ]
+            for prompt in retry_prompts:
+                if not has_hanzi(final):
+                    break
                 yield _ndjson({"_progress": "RETRY (한자 감지)"})
                 retry_messages = list(messages) + [
                     {"role": "assistant", "content": final},
-                    {
-                        "role": "user",
-                        "content": "방금 답변에 한자(중국어 글자)가 섞였습니다. 의미는 그대로 두고 한자 부분만 한글로 바꿔서 똑같이 짧게 다시 답해주세요. 마크다운/줄바꿈 없이 한 단락으로.",
-                    },
+                    {"role": "user", "content": prompt},
                 ]
                 retry_payload = dict(payload)
                 retry_payload["messages"] = retry_messages
                 try:
-                    r2 = await client.post(f"{OLLAMA_URL}/api/chat", json=retry_payload)
-                    if r2.status_code == 200:
-                        retried = (r2.json().get("message", {}).get("content") or "").strip()
+                    rr = await client.post(f"{OLLAMA_URL}/api/chat", json=retry_payload)
+                    if rr.status_code == 200:
+                        retried = (rr.json().get("message", {}).get("content") or "").strip()
                         if retried and not has_hanzi(retried):
                             final = retried
+                            break
+                        elif retried:
+                            final = retried  # keep newer attempt for next retry
                 except Exception:
                     pass
+            # Final fallback: just strip any remaining Hanja so TTS doesn't
+            # read it as Mandarin and confuse the user.
+            if has_hanzi(final):
+                yield _ndjson({"_progress": "STRIPPING HANJA"})
+                final = _HANZI_RE.sub("", final).strip()
 
             yield _ndjson({"message": {"content": final}, "done": True})
 
