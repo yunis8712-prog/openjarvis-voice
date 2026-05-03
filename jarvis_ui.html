@@ -601,21 +601,43 @@ function detectWakeWord(text) {
 
 // Brief audio cue when the wake word fires.
 let _audioCtx = null;
+function _ctx() {
+  _audioCtx = _audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  if (_audioCtx.state === "suspended") _audioCtx.resume();
+  return _audioCtx;
+}
 function playWakeBeep() {
   try {
-    _audioCtx = _audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (_audioCtx.state === "suspended") _audioCtx.resume();
-    const t = _audioCtx.currentTime;
-    const o = _audioCtx.createOscillator();
-    const g = _audioCtx.createGain();
+    const ctx = _ctx();
+    const t = ctx.currentTime;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
     o.type = "sine";
     o.frequency.setValueAtTime(880, t);
     o.frequency.exponentialRampToValueAtTime(1320, t + 0.07);
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(0.15, t + 0.02);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
-    o.connect(g); g.connect(_audioCtx.destination);
+    o.connect(g); g.connect(ctx.destination);
     o.start(t); o.stop(t + 0.2);
+  } catch {}
+}
+
+// Softer, lower-pitched cue when the assistant opens a follow-up window
+// after answering — signals "go ahead, I'm still listening."
+function playFollowupBeep() {
+  try {
+    const ctx = _ctx();
+    const t = ctx.currentTime;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = "sine";
+    o.frequency.value = 660;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.08, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(t); o.stop(t + 0.16);
   } catch {}
 }
 
@@ -740,6 +762,73 @@ function captureQuestionAfterWake() {
 function updateWakeUI() {
   elWakeState.textContent = wakeMode ? "ON" : "OFF";
   document.getElementById("btnWake").classList.toggle("active", wakeMode);
+}
+
+// After the assistant finishes answering, leave a short window open so the
+// user can ask a follow-up without re-saying "자비스". Resolves to the
+// transcribed string, or null if the window times out without speech.
+const FOLLOWUP_WINDOW_MS = 8000;
+let followupRecognition = null;
+let followupAbort = false;
+
+function abortFollowup() {
+  followupAbort = true;
+  if (followupRecognition) {
+    try { followupRecognition.abort(); } catch {}
+    followupRecognition = null;
+  }
+}
+
+function captureFollowupText() {
+  return new Promise((resolve) => {
+    if (!SR || !wakeMode) { resolve(null); return; }
+    followupAbort = false;
+    setState(STATE.LISTENING);
+    playFollowupBeep();
+    const live = log("FOLLOWUP — 듣고 있어요", "live");
+    const q = new SR();
+    q.lang = "ko-KR";
+    q.continuous = false;
+    q.interimResults = true;
+    q.maxAlternatives = 1;
+    let final = "";
+    let resolved = false;
+    const finish = (text) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try { q.abort(); } catch {}
+      followupRecognition = null;
+      resolve(text);
+    };
+    const timer = setTimeout(() => {
+      finish(null);
+    }, FOLLOWUP_WINDOW_MS);
+    q.onresult = (ev) => {
+      let f = "", interim = "";
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const t = ev.results[i][0].transcript || "";
+        if (ev.results[i].isFinal) f += t;
+        else interim += t;
+      }
+      if (live) live.textContent = "FOLLOWUP: " + (f || interim);
+      if (f.trim()) final = f.trim();
+    };
+    q.onerror = () => {
+      finish(final && final.length >= 2 ? final : null);
+    };
+    q.onend = () => {
+      if (followupAbort) finish(null);
+      else finish(final && final.length >= 2 ? final : null);
+    };
+    try {
+      q.start();
+      followupRecognition = q;
+    } catch (e) {
+      log("followup start failed: " + e.message, "error");
+      finish(null);
+    }
+  });
 }
 
 // ============ TTS — edge-tts (Neural) via backend, browser fallback ============
@@ -889,6 +978,46 @@ async function handleQuery(text) {
   await speak(reply);
   hideReply();
   setState(STATE.IDLE);
+
+  if (!wakeMode) return;
+  // Conversation mode: leave a follow-up window open so the user can keep
+  // talking without re-saying "자비스". Loop here instead of recursing.
+  while (wakeMode) {
+    const followup = await captureFollowupText();
+    if (!followup) break;
+    log("FOLLOWUP QUERY: " + followup, "query");
+    // Inline-process the next turn without going back through wake-listen.
+    addRecent(followup);
+    queryCount++;
+    elQc.textContent = queryCount;
+    hideReply();
+    setState(STATE.THINKING);
+    messages.push({ role: "user", content: followup });
+    log("INFERENCE ENGINE");
+    let r2, e2;
+    try {
+      ({ reply: r2, elapsed: e2 } = await askOllama(messages));
+    } catch (e) {
+      log("OLLAMA ERROR: " + e.message, "error");
+      messages.pop();
+      setState(STATE.IDLE);
+      break;
+    }
+    log("TOKEN STREAM OK");
+    elRsp.textContent = e2.toFixed(0) + "ms";
+    if (!r2) {
+      log("EMPTY RESPONSE", "error");
+      messages.pop();
+      setState(STATE.IDLE);
+      break;
+    }
+    messages.push({ role: "assistant", content: r2 });
+    setState(STATE.SPEAKING);
+    showReply(r2);
+    await speak(r2);
+    hideReply();
+    setState(STATE.IDLE);
+  }
   if (wakeMode) startWakeListener();
 }
 
@@ -904,6 +1033,8 @@ document.addEventListener("keydown", (e) => {
       stopWakeListener();
       startListening();
     } else if (state === STATE.LISTENING) {
+      // Could be either push-to-talk listening or an open follow-up window.
+      abortFollowup();
       stopListening();
     } else if (state === STATE.SPEAKING) {
       cancelSpeak();
@@ -914,6 +1045,7 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.code === "Escape") {
     cancelSpeak();
+    abortFollowup();
     if (state === STATE.LISTENING) {
       stopListening();
       if (questionRecognition) {
