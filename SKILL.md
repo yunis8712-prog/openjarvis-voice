@@ -37,7 +37,7 @@ it to a local LLM, and the answer comes back as natural Korean speech.
 ## Install
 
 ```bash
-git clone https://github.com/<owner>/openjarvis-voice
+git clone https://github.com/yunis8712-prog/openjarvis-voice
 cd openjarvis-voice
 uv sync
 ollama pull qwen2.5:14b-instruct-q3_K_M
@@ -101,4 +101,4 @@ To keep voice-bound answers tight:
 
 ## Repository
 
-https://github.com/&lt;owner&gt;/openjarvis-voice (push pending `gh auth login`)
+https://github.com/yunis8712-prog/openjarvis-voice
