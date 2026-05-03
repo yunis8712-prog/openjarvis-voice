@@ -650,6 +650,8 @@ function playFollowupBeep() {
   } catch {}
 }
 
+let wakeInterimLi = null;  // re-used <li> for live interim transcript
+
 function startWakeListener() {
   if (!SR || !wakeMode) return;
   if (wakeRecognition) return;
@@ -666,6 +668,8 @@ function startWakeListener() {
       log("MIC PERMISSION GRANTED");
       elMic.textContent = "ON";
     }
+    log('WAKE LISTENER ACTIVE — "자비스" 부르기', "live");
+    wakeInterimLi = null;
   };
   r.onresult = (ev) => {
     // Process interim results too — wake fires as soon as the wake word is
@@ -674,12 +678,26 @@ function startWakeListener() {
     // double-fire when the same hypothesis later becomes final.
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
       const t = ev.results[i][0].transcript || "";
+      const isFinal = ev.results[i].isFinal;
+      // Live diagnostic: show what STT is hearing in real time so the
+      // user can see if "자비스" is being transcribed correctly.
+      if (t.trim()) {
+        if (!wakeInterimLi) wakeInterimLi = log("들리는 중: " + t, "live");
+        else wakeInterimLi.textContent = "들리는 중: " + t;
+      }
       const m = detectWakeWord(t);
-      if (!m) continue;
+      if (!m) {
+        if (isFinal && t.trim()) {
+          log("못 알아들음: " + t.trim().slice(0, 40));
+          wakeInterimLi = null;
+        }
+        continue;
+      }
       const now = Date.now();
       if (now - lastWakeFireAt < WAKE_DEBOUNCE_MS) return;
       lastWakeFireAt = now;
       const after = m.after;
+      wakeInterimLi = null;
       try { r.abort(); } catch {}
       playWakeBeep();
       if (after.length >= 2) {
@@ -698,11 +716,14 @@ function startWakeListener() {
       elMic.textContent = "DENIED";
       wakeMode = false;
       updateWakeUI();
+    } else if (ev.error === "network") {
+      log("WAKE NETWORK ERROR — 인터넷 확인 필요", "error");
     }
-    // soft errors (no-speech, audio-capture, network) — let onend restart
+    // 'no-speech' / 'audio-capture' / 'aborted' are normal — let onend restart
   };
   r.onend = () => {
     wakeRecognition = null;
+    wakeInterimLi = null;
     // Auto-restart while in wake mode and idle (Chrome stops continuous SR
     // periodically; the loop keeps the wake word always-on).
     if (wakeMode && state === STATE.IDLE) {
