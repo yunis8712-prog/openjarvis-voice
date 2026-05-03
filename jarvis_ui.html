@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JARVIS V1.0</title>
+<style>
+  :root {
+    --bg: #020611;
+    --bg2: #06122a;
+    --cyan: #4cd6ff;
+    --cyan-dim: #1a4a6e;
+    --cyan-glow: rgba(76, 214, 255, 0.6);
+    --amber: #ffb84a;
+    --grid: rgba(76, 214, 255, 0.06);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background:
+      linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 32px 32px,
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 32px 32px,
+      radial-gradient(ellipse at center, var(--bg2) 0%, var(--bg) 70%);
+    color: var(--cyan);
+    font-family: "Share Tech Mono", "Consolas", "D2Coding", monospace;
+    font-size: 13px;
+    letter-spacing: 0.05em;
+  }
+  body::before {
+    content: "";
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(
+      0deg, rgba(76,214,255,0.02) 0px, rgba(76,214,255,0.02) 1px,
+      transparent 1px, transparent 3px);
+    pointer-events: none;
+    z-index: 100;
+  }
+  #app {
+    display: grid;
+    grid-template-columns: 240px 1fr 240px;
+    grid-template-rows: 56px 1fr 60px;
+    grid-template-areas:
+      "header header header"
+      "left   center right"
+      "left   bottom right";
+    height: 100vh;
+    gap: 8px;
+    padding: 8px;
+  }
+  header {
+    grid-area: header;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    border: 1px solid var(--cyan-dim);
+    background: rgba(6,18,42,0.6);
+  }
+  .brand {
+    font-size: 22px;
+    font-weight: bold;
+    color: var(--cyan);
+    text-shadow: 0 0 12px var(--cyan-glow);
+    letter-spacing: 0.2em;
+  }
+  .brand .v { color: var(--amber); margin-left: 8px; font-size: 14px; }
+  .header-actions { display: flex; gap: 12px; }
+  .header-actions button {
+    background: transparent;
+    border: 1px solid var(--cyan-dim);
+    color: var(--cyan);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 6px 14px;
+    cursor: pointer;
+    letter-spacing: 0.15em;
+  }
+  .header-actions button:hover { background: rgba(76,214,255,0.1); }
+  .header-actions button.active { background: var(--cyan); color: var(--bg); }
+
+  aside.panel {
+    border: 1px solid var(--cyan-dim);
+    background: rgba(6,18,42,0.4);
+    padding: 16px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  aside.left { grid-area: left; }
+  aside.right { grid-area: right; }
+
+  .section-title {
+    color: rgba(76,214,255,0.5);
+    font-size: 10px;
+    margin-bottom: 8px;
+    letter-spacing: 0.2em;
+  }
+  .stat { margin-bottom: 12px; }
+  .stat-label {
+    font-size: 10px;
+    color: rgba(76,214,255,0.6);
+    letter-spacing: 0.15em;
+  }
+  .stat-val {
+    font-size: 22px;
+    color: var(--cyan);
+    text-shadow: 0 0 8px var(--cyan-glow);
+    margin: 2px 0 4px;
+  }
+  .bar {
+    height: 2px;
+    background: linear-gradient(to right, var(--cyan), var(--amber));
+    width: 0%;
+    transition: width 0.5s;
+  }
+
+  #log, #recent, #protocols {
+    list-style: none;
+    font-size: 11px;
+    line-height: 1.6;
+    overflow-y: auto;
+    flex: 1;
+  }
+  #log li { color: rgba(76,214,255,0.7); }
+  #log li::before { content: "> "; color: var(--cyan); }
+  #log li.live { color: var(--cyan); text-shadow: 0 0 6px var(--cyan-glow); }
+  #log li.query { color: #fff; }
+  #log li.error { color: #ff5577; }
+  #log li.error::before { content: "! "; }
+  #recent li { color: rgba(76,214,255,0.7); padding: 3px 0; cursor: default; }
+  #recent li::before { content: "▶ "; color: var(--amber); }
+  #protocols li { padding: 3px 0; }
+  #protocols li::before { content: "◆ "; color: var(--cyan); }
+  #protocols li.disabled { color: rgba(76,214,255,0.25); }
+  #protocols li.disabled::before { color: rgba(76,214,255,0.25); }
+
+  main {
+    grid-area: center;
+    border: 1px solid var(--cyan-dim);
+    background: rgba(6,18,42,0.2);
+    position: relative;
+    overflow: hidden;
+  }
+  #orb { width: 100%; height: 100%; display: block; }
+  .reply-overlay {
+    position: absolute;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: 70%;
+    text-align: center;
+    color: rgba(255,255,255,0.92);
+    font-size: 14px;
+    line-height: 1.6;
+    text-shadow: 0 0 8px rgba(0,0,0,0.8);
+    pointer-events: none;
+    transition: opacity 0.3s;
+    opacity: 0;
+  }
+  .reply-overlay.visible { opacity: 1; }
+
+  footer {
+    grid-area: bottom;
+    border: 1px solid var(--cyan-dim);
+    background: rgba(6,18,42,0.6);
+    padding: 0 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .state-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px;
+    border: 1px solid var(--cyan-dim);
+    color: var(--cyan);
+    font-size: 11px;
+    letter-spacing: 0.2em;
+  }
+  .state-pill .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 8px var(--cyan-glow);
+    animation: pulse 1.5s infinite;
+  }
+  .state-pill.listening { color: var(--amber); border-color: var(--amber); }
+  .state-pill.listening .dot { background: var(--amber); box-shadow: 0 0 10px var(--amber); }
+  .state-pill.thinking { color: #ff7be6; border-color: #ff7be6; }
+  .state-pill.thinking .dot { background: #ff7be6; box-shadow: 0 0 10px #ff7be6; }
+  .state-pill.speaking { color: var(--cyan); }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .hint {
+    color: rgba(76,214,255,0.5);
+    font-size: 11px;
+    letter-spacing: 0.15em;
+  }
+  .hint kbd {
+    border: 1px solid var(--cyan-dim);
+    padding: 2px 8px;
+    margin: 0 4px;
+    color: var(--cyan);
+    background: rgba(76,214,255,0.05);
+    font-family: inherit;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">J.A.R.V.I.S.<span class="v">V1.0</span></div>
+    <div class="header-actions">
+      <button id="btnMute">MIC <span id="micState">READY</span></button>
+      <button id="btnClear">CLEAR</button>
+    </div>
+  </header>
+
+  <aside class="panel left">
+    <div>
+      <div class="section-title">// SYSTEM STATUS</div>
+      <div class="stat">
+        <div class="stat-label">CPU LOAD</div>
+        <div class="stat-val" id="cpuVal">0.0%</div>
+        <div class="bar" id="cpuBar"></div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">NEURAL NET</div>
+        <div class="stat-val" id="netVal">0.0%</div>
+        <div class="bar" id="netBar"></div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">RESPONSE</div>
+        <div class="stat-val" id="rspVal">— ms</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">QUERIES</div>
+        <div class="stat-val" id="qcVal">0</div>
+      </div>
+    </div>
+    <div style="flex:1; min-height:0; display:flex; flex-direction:column;">
+      <div class="section-title">// SYSTEM LOG</div>
+      <ul id="log"></ul>
+    </div>
+  </aside>
+
+  <main>
+    <canvas id="orb"></canvas>
+    <div class="reply-overlay" id="replyOverlay"></div>
+  </main>
+
+  <aside class="panel right">
+    <div>
+      <div class="section-title">// PROTOCOLS</div>
+      <ul id="protocols">
+        <li>NATURAL LANGUAGE</li>
+        <li>CONTEXT MEMORY</li>
+        <li>STT VOICE INPUT</li>
+        <li>EDGE-TTS NEURAL</li>
+        <li>WEB SEARCH</li>
+        <li>KBO · KBL · K-LEAGUE</li>
+        <li>LOTTO</li>
+        <li class="disabled">VISION MODULE</li>
+      </ul>
+    </div>
+    <div style="flex:1; min-height:0; display:flex; flex-direction:column;">
+      <div class="section-title">// RECENT</div>
+      <ul id="recent"></ul>
+    </div>
+  </aside>
+
+  <footer>
+    <div class="state-pill" id="statePill"><span class="dot"></span><span id="stateText">IDLE</span></div>
+    <div class="hint">
+      <kbd>SPACE</kbd> 눌러 말하기 (한 번 더 누르면 종료) ·
+      <kbd>ESC</kbd> 답변 중지
+    </div>
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+// ============ State ============
+const STATE = { IDLE: "idle", LISTENING: "listening", THINKING: "thinking", SPEAKING: "speaking" };
+let state = STATE.IDLE;
+let queryCount = 0;
+const messages = [
+  { role: "system", content: "당신은 한국어 음성 비서입니다. 답변 규칙을 반드시 지키세요:\n1) 항상 두 문장 이내, 100자 이내로만 답합니다.\n2) 마크다운, 제목, 리스트, 글머리 기호를 절대 쓰지 마세요. 자연스러운 구어체 한 단락으로만 답하세요.\n3) 한자(중국어 글자)는 절대 사용하지 마세요. 모든 글자는 한글로만 쓰세요. 외국 인명·고유명사는 한글 표기로 적습니다.\n4) 결과 없이 '다음과 같습니다' 같은 도입부를 붙이지 말고, 곧바로 결론부터 한 문장으로 답하세요.\n5) 단순 상식·역사·일반 지식은 자기 지식으로 답하세요.\n6) 모호하면 추측하지 말고 되묻거나 모른다고 답하세요." }
+];
+
+const elState = document.getElementById("stateText");
+const elPill = document.getElementById("statePill");
+const elLog = document.getElementById("log");
+const elRecent = document.getElementById("recent");
+const elReply = document.getElementById("replyOverlay");
+const elMic = document.getElementById("micState");
+const elCpuVal = document.getElementById("cpuVal");
+const elCpuBar = document.getElementById("cpuBar");
+const elNetVal = document.getElementById("netVal");
+const elNetBar = document.getElementById("netBar");
+const elRsp = document.getElementById("rspVal");
+const elQc = document.getElementById("qcVal");
+
+function setState(s) {
+  state = s;
+  elState.textContent = s.toUpperCase();
+  elPill.className = "state-pill " + s;
+}
+
+function log(text, cls = "") {
+  const li = document.createElement("li");
+  if (cls) li.className = cls;
+  li.textContent = text;
+  elLog.appendChild(li);
+  elLog.scrollTop = elLog.scrollHeight;
+  while (elLog.children.length > 50) elLog.removeChild(elLog.firstChild);
+  return li;
+}
+
+function addRecent(text) {
+  const li = document.createElement("li");
+  li.textContent = text.length > 30 ? text.slice(0, 30) + "…" : text;
+  li.title = text;
+  elRecent.insertBefore(li, elRecent.firstChild);
+  while (elRecent.children.length > 8) elRecent.removeChild(elRecent.lastChild);
+}
+
+function showReply(text) {
+  elReply.textContent = text;
+  elReply.classList.add("visible");
+}
+function hideReply() { elReply.classList.remove("visible"); }
+
+// ============ Particle Orb ============
+const canvas = document.getElementById("orb");
+const ctx = canvas.getContext("2d");
+let DPR = Math.min(window.devicePixelRatio || 1, 2);
+function resize() {
+  canvas.width = canvas.clientWidth * DPR;
+  canvas.height = canvas.clientHeight * DPR;
+}
+window.addEventListener("resize", resize);
+resize();
+
+const PARTICLES = 280;
+const particles = [];
+for (let i = 0; i < PARTICLES; i++) {
+  const phi = Math.acos(2 * Math.random() - 1);
+  const theta = Math.random() * Math.PI * 2;
+  const rad = 0.85 + Math.random() * 0.3;
+  particles.push({ phi, theta, rad, jitter: Math.random() });
+}
+
+let rotY = 0, rotX = 0;
+let pulse = 0;
+let speakingPulse = 0;
+
+function colorForState() {
+  switch (state) {
+    case STATE.LISTENING: return [255, 184, 74];
+    case STATE.THINKING:  return [255, 123, 230];
+    case STATE.SPEAKING:  return [120, 230, 255];
+    default:              return [76, 214, 255];
+  }
+}
+
+function draw() {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2, cy = h / 2;
+  const baseRadius = Math.min(w, h) * 0.27;
+
+  pulse += 0.025;
+  if (state === STATE.SPEAKING) speakingPulse = Math.min(1, speakingPulse + 0.08);
+  else speakingPulse = Math.max(0, speakingPulse - 0.05);
+
+  const [cr, cg, cb] = colorForState();
+  const stateBoost = state === STATE.LISTENING ? 1.15 :
+                     state === STATE.THINKING  ? 0.95 :
+                     state === STATE.SPEAKING  ? 1.08 + Math.sin(pulse * 4) * 0.06 * speakingPulse :
+                                                 1.0;
+  const radius = baseRadius * stateBoost;
+
+  // Inner radial glow
+  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius * 0.9);
+  grad.addColorStop(0, `rgba(${cr},${cg},${cb},0.45)`);
+  grad.addColorStop(0.5, `rgba(${cr},${cg},${cb},0.12)`);
+  grad.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, w, h);
+
+  // Concentric rings
+  ctx.lineWidth = 1 * DPR;
+  for (let i = 1; i <= 4; i++) {
+    const r = radius * (0.55 + i * 0.18);
+    const a = 0.18 - i * 0.025;
+    ctx.strokeStyle = `rgba(${cr},${cg},${cb},${a})`;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Sweep line (rotates slowly, longer when listening)
+  const sweepLen = state === STATE.LISTENING ? 1.05 : 0.8;
+  ctx.strokeStyle = `rgba(${cr},${cg},${cb},0.25)`;
+  ctx.lineWidth = 1.5 * DPR;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(rotY * 1.3) * radius * sweepLen,
+             cy + Math.sin(rotY * 1.3) * radius * sweepLen);
+  ctx.stroke();
+
+  // Particles
+  rotY += state === STATE.THINKING ? 0.012 : 0.004;
+  rotX += 0.0018;
+  const cosX = Math.cos(rotX), sinX = Math.sin(rotX);
+
+  for (const p of particles) {
+    const sp = Math.sin(p.phi);
+    let px = sp * Math.cos(p.theta + rotY);
+    let py = Math.cos(p.phi);
+    let pz = sp * Math.sin(p.theta + rotY);
+    // Tilt around X axis
+    const ty = py * cosX - pz * sinX;
+    const tz = py * sinX + pz * cosX;
+    py = ty; pz = tz;
+
+    const jitterAmp = state === STATE.LISTENING ? 0.06 :
+                      state === STATE.THINKING  ? 0.04 :
+                      state === STATE.SPEAKING  ? 0.05 * speakingPulse :
+                                                  0.015;
+    const j = 1 + Math.sin(pulse + p.jitter * 6.28) * jitterAmp;
+
+    const sx = cx + px * radius * p.rad * j;
+    const sy = cy + py * radius * p.rad * j;
+    const depth = (pz + 1) / 2;
+    const size = (1 + depth * 2.2) * DPR;
+    const alpha = 0.25 + depth * 0.7;
+    ctx.fillStyle = `rgba(${cr},${cg},${cb},${alpha})`;
+    ctx.beginPath();
+    ctx.arc(sx, sy, size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Core glow point
+  const coreR = (4 + Math.sin(pulse * 2) * 2) * DPR;
+  const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, coreR * 6);
+  coreGrad.addColorStop(0, `rgba(${cr},${cg},${cb},0.95)`);
+  coreGrad.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+  ctx.fillStyle = coreGrad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, coreR * 6, 0, Math.PI * 2);
+  ctx.fill();
+
+  requestAnimationFrame(draw);
+}
+draw();
+
+// ============ Live status sim (cosmetic) ============
+function updateStats() {
+  const cpu = 30 + Math.random() * 25 + (state === STATE.THINKING ? 25 : 0);
+  const net = 35 + Math.random() * 20 + (state === STATE.THINKING ? 30 : 0);
+  elCpuVal.textContent = cpu.toFixed(1) + "%";
+  elNetVal.textContent = net.toFixed(1) + "%";
+  elCpuBar.style.width = Math.min(100, cpu) + "%";
+  elNetBar.style.width = Math.min(100, net) + "%";
+}
+setInterval(updateStats, 800);
+updateStats();
+
+// ============ STT (webkitSpeechRecognition) ============
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+let micGranted = false;
+
+function setupRecognition() {
+  if (!SR) {
+    log("SPEECH RECOGNITION UNSUPPORTED — Chrome 권장", "error");
+    elMic.textContent = "N/A";
+    return null;
+  }
+  const r = new SR();
+  r.lang = "ko-KR";
+  r.continuous = false;
+  r.interimResults = true;
+  r.maxAlternatives = 1;
+
+  let interim = "";
+  let liveLogLi = null;
+
+  r.onstart = () => {
+    interim = "";
+    liveLogLi = log("LISTENING...", "live");
+    setState(STATE.LISTENING);
+    if (!micGranted) {
+      micGranted = true;
+      log("MIC PERMISSION GRANTED");
+      elMic.textContent = "ON";
+    }
+  };
+  r.onresult = (ev) => {
+    interim = "";
+    let final = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const t = ev.results[i][0].transcript;
+      if (ev.results[i].isFinal) final += t;
+      else interim += t;
+    }
+    if (liveLogLi) liveLogLi.textContent = "LISTENING: " + (final || interim);
+    if (final.trim()) {
+      handleQuery(final.trim());
+    }
+  };
+  r.onerror = (ev) => {
+    log("STT ERROR: " + ev.error, "error");
+    if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+      elMic.textContent = "DENIED";
+    }
+    if (state === STATE.LISTENING) setState(STATE.IDLE);
+  };
+  r.onend = () => {
+    if (state === STATE.LISTENING) {
+      // No final result captured
+      setState(STATE.IDLE);
+    }
+  };
+  return r;
+}
+recognition = setupRecognition();
+
+function startListening() {
+  if (!recognition) return;
+  if (state !== STATE.IDLE) return;
+  try {
+    cancelSpeak();
+    recognition.start();
+  } catch (e) {
+    log("STT start failed: " + e.message, "error");
+  }
+}
+function stopListening() {
+  if (!recognition) return;
+  if (state === STATE.LISTENING) {
+    try { recognition.stop(); } catch {}
+  }
+}
+
+// ============ TTS — edge-tts (Neural) via backend, browser fallback ============
+const TTS_VOICE = (new URLSearchParams(location.search)).get("voice") || "ko-KR-SunHiNeural";
+
+let currentAudio = null;
+function cancelSpeak() {
+  if (currentAudio) { try { currentAudio.pause(); } catch {} currentAudio = null; }
+  try { cancelSpeak(); } catch {}
+}
+
+async function speakEdge(text) {
+  const r = await fetch("/api/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice: TTS_VOICE })
+  });
+  if (!r.ok) throw new Error("tts " + r.status);
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  currentAudio = audio;
+  await new Promise((resolve) => {
+    audio.onended = resolve;
+    audio.onerror = resolve;
+    audio.play().catch(resolve);
+  });
+  URL.revokeObjectURL(url);
+  if (currentAudio === audio) currentAudio = null;
+}
+
+let voicesCache = [];
+function loadVoices() { voicesCache = speechSynthesis.getVoices(); }
+loadVoices();
+if (typeof speechSynthesis.onvoiceschanged !== "undefined") {
+  speechSynthesis.onvoiceschanged = loadVoices;
+}
+
+function speakBrowser(text) {
+  return new Promise((resolve) => {
+    if (!text.trim()) { resolve(); return; }
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "ko-KR";
+    const ko = voicesCache.find(v => v.lang && v.lang.toLowerCase().startsWith("ko"));
+    if (ko) u.voice = ko;
+    u.rate = 1.05;
+    u.onend = () => resolve();
+    u.onerror = () => resolve();
+    speechSynthesis.speak(u);
+  });
+}
+
+async function speak(text) {
+  cancelSpeak();
+  if (!text.trim()) return;
+  try {
+    await speakEdge(text);
+  } catch (e) {
+    log("EDGE-TTS FAIL → BROWSER FALLBACK: " + e.message, "error");
+    await speakBrowser(text);
+  }
+}
+
+// ============ Ollama streaming ============
+const MODEL = "qwen2.5:14b-instruct-q3_K_M";
+
+async function askOllama(history) {
+  const t0 = performance.now();
+  const r = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: MODEL, messages: history, tools_enabled: true })
+  });
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error("HTTP " + r.status + " " + text.slice(0, 200));
+  }
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let reply = "";
+  let serverError = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const j = JSON.parse(line);
+        if (j._progress) {
+          log(j._progress);
+        } else if (j.error) {
+          serverError = j.error;
+        } else if (j.message && j.message.content) {
+          reply += j.message.content;
+        }
+      } catch {}
+    }
+  }
+  if (serverError) throw new Error(serverError);
+  const elapsed = performance.now() - t0;
+  return { reply: reply.trim(), elapsed };
+}
+
+// ============ Pipeline ============
+async function handleQuery(text) {
+  if (state !== STATE.LISTENING) return;
+  log("QUERY: " + text, "query");
+  addRecent(text);
+  queryCount++;
+  elQc.textContent = queryCount;
+  hideReply();
+  setState(STATE.THINKING);
+
+  messages.push({ role: "user", content: text });
+  log("INFERENCE ENGINE");
+  let reply, elapsed;
+  try {
+    ({ reply, elapsed } = await askOllama(messages));
+  } catch (e) {
+    log("OLLAMA ERROR: " + e.message, "error");
+    messages.pop();
+    setState(STATE.IDLE);
+    return;
+  }
+  log("TOKEN STREAM OK");
+  elRsp.textContent = elapsed.toFixed(0) + "ms";
+  if (!reply) {
+    log("EMPTY RESPONSE", "error");
+    messages.pop();
+    setState(STATE.IDLE);
+    return;
+  }
+  messages.push({ role: "assistant", content: reply });
+  setState(STATE.SPEAKING);
+  showReply(reply);
+  await speak(reply);
+  hideReply();
+  setState(STATE.IDLE);
+}
+
+// ============ Keybinds & UI ============
+let spaceHeld = false;
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  if (e.code === "Space" && !e.repeat) {
+    e.preventDefault();
+    spaceHeld = true;
+    if (state === STATE.IDLE) startListening();
+    else if (state === STATE.LISTENING) stopListening();
+    else if (state === STATE.SPEAKING) {
+      cancelSpeak();
+      setState(STATE.IDLE);
+      hideReply();
+    }
+  }
+  if (e.code === "Escape") {
+    cancelSpeak();
+    if (state === STATE.LISTENING) stopListening();
+    else if (state === STATE.SPEAKING) { setState(STATE.IDLE); hideReply(); }
+  }
+});
+
+document.getElementById("btnMute").addEventListener("click", () => {
+  if (state === STATE.IDLE) startListening();
+  else if (state === STATE.LISTENING) stopListening();
+});
+document.getElementById("btnClear").addEventListener("click", () => {
+  messages.length = 1; // keep system prompt
+  queryCount = 0;
+  elQc.textContent = "0";
+  elLog.innerHTML = "";
+  elRecent.innerHTML = "";
+  elRsp.textContent = "— ms";
+  hideReply();
+  log("CONTEXT CLEARED");
+});
+
+// ============ Boot sequence ============
+const boot = [
+  "BANDWIDTH OPTIMAL",
+  "SUBSYSTEM NOMINAL",
+  "NEURAL NET OK",
+  "CONTEXT LOADED",
+  "API LINK ACTIVE",
+  "MEMORY BANKS OK",
+  "VECTOR DB ONLINE",
+  "ENCRYPTION ACTIVE",
+];
+(async () => {
+  for (const line of boot) {
+    log(line);
+    await new Promise(r => setTimeout(r, 120));
+  }
+  log("READY — SPACE 눌러 말하기");
+})();
+</script>
+</body>
+</html>
