@@ -215,6 +215,7 @@
   <header>
     <div class="brand">J.A.R.V.I.S.<span class="v">V1.0</span></div>
     <div class="header-actions">
+      <button id="btnWake">WAKE <span id="wakeState">OFF</span></button>
       <button id="btnMute">MIC <span id="micState">READY</span></button>
       <button id="btnClear">CLEAR</button>
     </div>
@@ -276,8 +277,9 @@
   <footer>
     <div class="state-pill" id="statePill"><span class="dot"></span><span id="stateText">IDLE</span></div>
     <div class="hint">
-      <kbd>SPACE</kbd> 눌러 말하기 (한 번 더 누르면 종료) ·
-      <kbd>ESC</kbd> 답변 중지
+      <kbd>SPACE</kbd> 말하기 ·
+      <kbd>ESC</kbd> 중지 ·
+      WAKE ON일 땐 <b>"자비스"</b>라고 부르세요
     </div>
   </footer>
 </div>
@@ -550,13 +552,152 @@ function stopListening() {
   }
 }
 
+// ============ Wake-word mode ============
+// Continuous SR scans for "자비스" (and common Korean STT mis-hearings).
+// Two patterns supported:
+//   "자비스 [질문…]"  → process immediately
+//   "자비스"          → next utterance becomes the question
+// Wake listener pauses during THINKING/SPEAKING (TTS feedback prevention)
+// and auto-resumes on IDLE. Toggled by the WAKE button.
+const WAKE_WORDS = ["자비스", "재비스", "저비스", "자비수", "재미스", "jarvis"];
+const elWakeState = document.getElementById("wakeState");
+let wakeMode = false;
+let wakeRecognition = null;
+let questionRecognition = null;
+
+function detectWakeWord(text) {
+  const lc = text.toLowerCase();
+  for (const w of WAKE_WORDS) {
+    const idx = lc.indexOf(w);
+    if (idx >= 0) return { idx, len: w.length };
+  }
+  return null;
+}
+
+function startWakeListener() {
+  if (!SR || !wakeMode) return;
+  if (wakeRecognition) return;
+  if (state !== STATE.IDLE) return;
+  const r = new SR();
+  r.lang = "ko-KR";
+  r.continuous = true;
+  r.interimResults = true;
+  r.maxAlternatives = 1;
+
+  r.onstart = () => {
+    if (!micGranted) {
+      micGranted = true;
+      log("MIC PERMISSION GRANTED");
+      elMic.textContent = "ON";
+    }
+  };
+  r.onresult = (ev) => {
+    // Only react to final results to avoid double-firing on interim partials.
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      if (!ev.results[i].isFinal) continue;
+      const t = ev.results[i][0].transcript || "";
+      const m = detectWakeWord(t);
+      if (!m) continue;
+      const after = t.slice(m.idx + m.len).replace(/^[\s,.!?·…]+/, "").trim();
+      try { r.stop(); } catch {}
+      if (after.length >= 2) {
+        log("WAKE: " + t.trim(), "live");
+        handleQuery(after);
+      } else {
+        log("WAKE — 듣고 있어요", "live");
+        captureQuestionAfterWake();
+      }
+      return;
+    }
+  };
+  r.onerror = (ev) => {
+    if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+      log("WAKE LISTEN BLOCKED: " + ev.error, "error");
+      elMic.textContent = "DENIED";
+      wakeMode = false;
+      updateWakeUI();
+    }
+    // soft errors (no-speech, audio-capture, network) — let onend restart
+  };
+  r.onend = () => {
+    wakeRecognition = null;
+    // Auto-restart while in wake mode and idle (Chrome stops continuous SR
+    // periodically; the loop keeps the wake word always-on).
+    if (wakeMode && state === STATE.IDLE) {
+      setTimeout(startWakeListener, 250);
+    }
+  };
+  try {
+    r.start();
+    wakeRecognition = r;
+  } catch (e) {
+    // start() throws if another recognition is already running
+    log("wake start failed: " + e.message, "error");
+  }
+}
+
+function stopWakeListener() {
+  if (wakeRecognition) {
+    try { wakeRecognition.abort(); } catch {}
+    wakeRecognition = null;
+  }
+}
+
+function captureQuestionAfterWake() {
+  if (questionRecognition) return;
+  setState(STATE.LISTENING);
+  const q = new SR();
+  q.lang = "ko-KR";
+  q.continuous = false;
+  q.interimResults = true;
+  q.maxAlternatives = 1;
+  let live = log("LISTENING...", "live");
+  let final = "";
+  q.onresult = (ev) => {
+    let f = "", interim = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const t = ev.results[i][0].transcript || "";
+      if (ev.results[i].isFinal) f += t;
+      else interim += t;
+    }
+    if (live) live.textContent = "LISTENING: " + (f || interim);
+    if (f.trim()) final = f.trim();
+  };
+  q.onerror = (ev) => {
+    log("STT ERROR: " + ev.error, "error");
+  };
+  q.onend = () => {
+    questionRecognition = null;
+    if (final && final.length >= 2) {
+      handleQuery(final);
+    } else {
+      log("(빈 음성, 대기 모드 복귀)");
+      setState(STATE.IDLE);
+      if (wakeMode) startWakeListener();
+    }
+  };
+  try {
+    q.start();
+    questionRecognition = q;
+  } catch (e) {
+    log("question STT start failed: " + e.message, "error");
+    setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
+  }
+}
+
+function updateWakeUI() {
+  elWakeState.textContent = wakeMode ? "ON" : "OFF";
+  document.getElementById("btnWake").classList.toggle("active", wakeMode);
+}
+
 // ============ TTS — edge-tts (Neural) via backend, browser fallback ============
 const TTS_VOICE = (new URLSearchParams(location.search)).get("voice") || "ko-KR-SunHiNeural";
 
 let currentAudio = null;
 function cancelSpeak() {
   if (currentAudio) { try { currentAudio.pause(); } catch {} currentAudio = null; }
-  try { cancelSpeak(); } catch {}
+  try { speechSynthesis.cancel(); } catch {}
 }
 
 async function speakEdge(text) {
@@ -657,7 +798,12 @@ async function askOllama(history) {
 
 // ============ Pipeline ============
 async function handleQuery(text) {
-  if (state !== STATE.LISTENING) return;
+  // Accept calls from push-to-talk (state=LISTENING) and wake-word path
+  // (state=IDLE or LISTENING). Reject only when already busy.
+  if (state === STATE.THINKING || state === STATE.SPEAKING) return;
+  // Make sure wake listener is paused while we're processing — the
+  // assistant's own TTS could otherwise be picked up as a new wake.
+  stopWakeListener();
   log("QUERY: " + text, "query");
   addRecent(text);
   queryCount++;
@@ -674,6 +820,7 @@ async function handleQuery(text) {
     log("OLLAMA ERROR: " + e.message, "error");
     messages.pop();
     setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
     return;
   }
   log("TOKEN STREAM OK");
@@ -682,6 +829,7 @@ async function handleQuery(text) {
     log("EMPTY RESPONSE", "error");
     messages.pop();
     setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
     return;
   }
   messages.push({ role: "assistant", content: reply });
@@ -690,6 +838,7 @@ async function handleQuery(text) {
   await speak(reply);
   hideReply();
   setState(STATE.IDLE);
+  if (wakeMode) startWakeListener();
 }
 
 // ============ Keybinds & UI ============
@@ -699,24 +848,58 @@ document.addEventListener("keydown", (e) => {
   if (e.code === "Space" && !e.repeat) {
     e.preventDefault();
     spaceHeld = true;
-    if (state === STATE.IDLE) startListening();
-    else if (state === STATE.LISTENING) stopListening();
-    else if (state === STATE.SPEAKING) {
+    if (state === STATE.IDLE) {
+      // Wake listener (if running) holds the mic; release it before manual.
+      stopWakeListener();
+      startListening();
+    } else if (state === STATE.LISTENING) {
+      stopListening();
+    } else if (state === STATE.SPEAKING) {
       cancelSpeak();
       setState(STATE.IDLE);
       hideReply();
+      if (wakeMode) startWakeListener();
     }
   }
   if (e.code === "Escape") {
     cancelSpeak();
-    if (state === STATE.LISTENING) stopListening();
-    else if (state === STATE.SPEAKING) { setState(STATE.IDLE); hideReply(); }
+    if (state === STATE.LISTENING) {
+      stopListening();
+      if (questionRecognition) {
+        try { questionRecognition.abort(); } catch {}
+        questionRecognition = null;
+      }
+    } else if (state === STATE.SPEAKING) {
+      setState(STATE.IDLE);
+      hideReply();
+      if (wakeMode) startWakeListener();
+    }
+  }
+});
+
+document.getElementById("btnWake").addEventListener("click", () => {
+  if (!SR) {
+    log("SR UNSUPPORTED — Chrome 권장", "error");
+    return;
+  }
+  wakeMode = !wakeMode;
+  updateWakeUI();
+  if (wakeMode) {
+    log('WAKE WORD MODE — "자비스" 라고 부르세요');
+    if (state === STATE.IDLE) startWakeListener();
+  } else {
+    log("WAKE WORD MODE OFF");
+    stopWakeListener();
   }
 });
 
 document.getElementById("btnMute").addEventListener("click", () => {
-  if (state === STATE.IDLE) startListening();
-  else if (state === STATE.LISTENING) stopListening();
+  if (state === STATE.IDLE) {
+    stopWakeListener();
+    startListening();
+  } else if (state === STATE.LISTENING) {
+    stopListening();
+  }
 });
 document.getElementById("btnClear").addEventListener("click", () => {
   messages.length = 1; // keep system prompt
@@ -745,7 +928,8 @@ const boot = [
     log(line);
     await new Promise(r => setTimeout(r, 120));
   }
-  log("READY — SPACE 눌러 말하기");
+  log('READY — SPACE 눌러 말하기 또는 WAKE ON 후 "자비스" 부르기');
+  updateWakeUI();
 })();
 </script>
 </body>
