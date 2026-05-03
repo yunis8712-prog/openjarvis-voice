@@ -521,7 +521,12 @@ function setupRecognition() {
     }
   };
   r.onerror = (ev) => {
-    log("STT ERROR: " + ev.error, "error");
+    // 'no-speech' just means the user didn't say anything within the
+    // recognition window — that's expected and not actionable, so we
+    // skip it from the user-facing log to keep things quiet.
+    if (ev.error !== "no-speech" && ev.error !== "aborted") {
+      log("STT ERROR: " + ev.error, "error");
+    }
     if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
       elMic.textContent = "DENIED";
     }
@@ -532,6 +537,9 @@ function setupRecognition() {
       // No final result captured
       setState(STATE.IDLE);
     }
+    // If the user is in wake-word mode, the wake listener takes the mic
+    // back as soon as the manual recognition releases it.
+    if (wakeMode && state === STATE.IDLE) startWakeListener();
   };
   return r;
 }
@@ -738,7 +746,9 @@ function captureQuestionAfterWake() {
     if (f.trim()) final = f.trim();
   };
   q.onerror = (ev) => {
-    log("STT ERROR: " + ev.error, "error");
+    if (ev.error !== "no-speech" && ev.error !== "aborted") {
+      log("STT ERROR: " + ev.error, "error");
+    }
   };
   q.onend = () => {
     questionRecognition = null;
@@ -1095,7 +1105,15 @@ document.getElementById("btnWake").addEventListener("click", () => {
   updateWakeUI();
   if (wakeMode) {
     log('WAKE WORD MODE — "자비스" 라고 부르세요');
-    if (state === STATE.IDLE) startWakeListener();
+    // If a push-to-talk session is mid-flight, stop it first; main
+    // recognition's onend will start the wake listener once the mic frees up.
+    if (state === STATE.LISTENING) {
+      try { recognition && recognition.abort(); } catch {}
+    } else if (state === STATE.IDLE) {
+      startWakeListener();
+    }
+    // SPEAKING / THINKING: wake listener resumes naturally when state
+    // returns to IDLE via the existing handleQuery flow.
   } else {
     log("WAKE WORD MODE OFF");
     stopWakeListener();
