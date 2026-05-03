@@ -474,6 +474,70 @@ def compute_running(text: str) -> str | None:
     return None
 
 
+# ── Cloud GPT (OpenAI) escape hatch ────────────────────────────────────
+GPT_KEYWORDS = (
+    "gpt", "지피티", "chatgpt", "챗지피티",
+    "openai", "오픈ai", "오픈 ai", "오픈에이아이",
+)
+GPT_MODEL = os.environ.get("JARVIS_GPT_MODEL", "gpt-4o-mini")
+# Phrases stripped from the user message before forwarding to OpenAI so
+# the model isn't told "ask GPT" — it IS GPT now.
+_GPT_STRIP = (
+    "GPT 연결해서", "GPT한테", "GPT로", "GPT에게", "GPT한테 물어봐", "GPT 한테",
+    "지피티 연결해서", "지피티한테", "지피티로", "지피티에게",
+    "ChatGPT한테", "ChatGPT에게", "챗지피티한테", "챗지피티에게",
+    "gpt 연결해서", "gpt한테", "gpt로", "gpt에게",
+)
+
+
+def needs_gpt(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(k in t for k in GPT_KEYWORDS)
+
+
+def _strip_gpt_triggers(content: str) -> str:
+    out = content
+    for s in _GPT_STRIP:
+        out = out.replace(s, "")
+    return out.strip(" ,.?!·")
+
+
+async def ask_openai_chat(messages: list[dict]) -> tuple[str, str | None]:
+    """Returns (answer, error_or_None)."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return (
+            "OpenAI API 키가 설정되지 않았습니다. "
+            "PowerShell에서 환경변수 OPENAI_API_KEY를 등록한 뒤 서버를 다시 띄워주세요.",
+            "no_key",
+        )
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        return ("openai 패키지가 설치되지 않았습니다.", "import_error")
+
+    cleaned = []
+    for m in messages:
+        if m.get("role") == "user":
+            cleaned.append({**m, "content": _strip_gpt_triggers(m.get("content", ""))})
+        else:
+            cleaned.append(m)
+
+    client = AsyncOpenAI(api_key=api_key)
+    try:
+        resp = await client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=cleaned,
+            max_tokens=220,
+            temperature=0.3,
+        )
+        return (resp.choices[0].message.content.strip(), None)
+    except Exception as exc:
+        return (f"GPT 호출 실패: {exc}", "api_error")
+
+
 SEARCH_RESULTS = 8
 FETCH_TOP_N = 3
 FETCH_MAX_CHARS = 1800
@@ -587,6 +651,16 @@ async def chat(req: Request) -> StreamingResponse:
             break
 
     async def gen():
+        # Cloud GPT escape hatch — explicit user opt-in via "GPT" / "지피티".
+        # Wins over every domain router below (overrides local ollama too).
+        if last_user and needs_gpt(last_user):
+            yield _ndjson({"_progress": f"OPENAI {GPT_MODEL}"})
+            answer, err = await ask_openai_chat(messages)
+            if err:
+                yield _ndjson({"_progress": f"GPT: {err}"})
+            yield _ndjson({"message": {"content": answer}, "done": True})
+            return
+
         injected = None  # tuple (label, content) when a domain handler ran
         if search_enabled and last_user:
             if needs_kbo(last_user):
