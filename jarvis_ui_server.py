@@ -26,6 +26,10 @@ ROOT = Path(__file__).parent.resolve()
 HTML = ROOT / "jarvis_ui.html"
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 SEARCH_REGION = os.environ.get("JARVIS_SEARCH_REGION", "kr-kr")
+# "openai" makes GPT the default engine for every query (user can still
+# override per-request by sending {"force_gpt": false}). "ollama" keeps
+# local-first behavior. The frontend toggle wins over this default.
+DEFAULT_BACKEND = (os.environ.get("JARVIS_DEFAULT_BACKEND") or "ollama").lower()
 
 app = FastAPI(title="JARVIS UI")
 
@@ -672,6 +676,14 @@ async def chat(req: Request) -> StreamingResponse:
     messages = list(data.get("messages") or [])
     model = data.get("model") or "qwen2.5:14b-instruct-q3_K_M"
     search_enabled = bool(data.get("tools_enabled", True))
+    # Engine selection precedence (highest wins):
+    #   1. Per-message keyword "GPT" / "지피티" in user text
+    #   2. Per-request frontend toggle: force_gpt true|false
+    #   3. Server-side default: JARVIS_DEFAULT_BACKEND env var
+    if "force_gpt" in data:
+        client_pref_gpt = bool(data.get("force_gpt"))
+    else:
+        client_pref_gpt = (DEFAULT_BACKEND == "openai")
 
     last_user = ""
     for m in reversed(messages):
@@ -680,15 +692,8 @@ async def chat(req: Request) -> StreamingResponse:
             break
 
     async def gen():
-        # Cloud GPT escape hatch — explicit user opt-in via "GPT" / "지피티".
-        # Wins over every domain router below (overrides local ollama too).
-        if last_user and needs_gpt(last_user):
-            yield _ndjson({"_progress": f"OPENAI {GPT_MODEL}"})
-            answer, err = await ask_openai_chat(messages)
-            if err:
-                yield _ndjson({"_progress": f"GPT: {err}"})
-            yield _ndjson({"message": {"content": answer}, "done": True})
-            return
+        # Final engine: GPT if explicitly invoked or toggled on, else local ollama.
+        use_gpt = client_pref_gpt or (last_user and needs_gpt(last_user))
 
         injected = None  # tuple (label, content) when a domain handler ran
         # Social / small-talk bypasses every search/domain branch — let the
@@ -789,6 +794,16 @@ async def chat(req: Request) -> StreamingResponse:
                 insert_at = len(messages) - 1
                 messages.insert(insert_at, {"role": "system", "content": f"{preface}\n\n{body}"})
                 yield _ndjson({"_progress": "SYNTHESIZING ANSWER..."})
+
+        # Final answer synthesis — GPT (cloud) or ollama (local). Domain
+        # context that was injected above is part of `messages` either way.
+        if use_gpt:
+            yield _ndjson({"_progress": f"OPENAI {GPT_MODEL}"})
+            answer, err = await ask_openai_chat(messages)
+            if err:
+                yield _ndjson({"_progress": f"GPT: {err}"})
+            yield _ndjson({"message": {"content": answer}, "done": True})
+            return
 
         payload = {
             "model": model,

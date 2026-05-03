@@ -215,6 +215,7 @@
   <header>
     <div class="brand">J.A.R.V.I.S.<span class="v">V1.0</span></div>
     <div class="header-actions">
+      <button id="btnGpt">GPT <span id="gptState">OFF</span></button>
       <button id="btnWake">WAKE <span id="wakeState">OFF</span></button>
       <button id="btnMute">MIC <span id="micState">READY</span></button>
       <button id="btnClear">CLEAR</button>
@@ -892,15 +893,33 @@ async function speak(text) {
   }
 }
 
-// ============ Ollama streaming ============
+// ============ Engine selection (local ollama vs cloud GPT) ============
 const MODEL = "qwen2.5:14b-instruct-q3_K_M";
+// Persisted across reloads via localStorage. URL ?gpt=on forces it on
+// for shareable launch links; ?gpt=off forces it off.
+let gptMode = (() => {
+  const p = new URLSearchParams(location.search).get("gpt");
+  if (p === "on") return true;
+  if (p === "off") return false;
+  return localStorage.getItem("jarvis.gptMode") === "1";
+})();
+const elGptState = document.getElementById("gptState");
+function updateGptUI() {
+  elGptState.textContent = gptMode ? "ON" : "OFF";
+  document.getElementById("btnGpt").classList.toggle("active", gptMode);
+}
 
 async function askOllama(history) {
   const t0 = performance.now();
   const r = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: MODEL, messages: history, tools_enabled: true })
+    body: JSON.stringify({
+      model: MODEL,
+      messages: history,
+      tools_enabled: true,
+      force_gpt: gptMode,
+    })
   });
   if (!r.ok) {
     const text = await r.text();
@@ -1060,6 +1079,13 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+document.getElementById("btnGpt").addEventListener("click", () => {
+  gptMode = !gptMode;
+  localStorage.setItem("jarvis.gptMode", gptMode ? "1" : "0");
+  updateGptUI();
+  log(gptMode ? "GPT MODE ON — 모든 답변 OpenAI 합성" : "GPT MODE OFF — 로컬 ollama 답변");
+});
+
 document.getElementById("btnWake").addEventListener("click", () => {
   if (!SR) {
     log("SR UNSUPPORTED — Chrome 권장", "error");
@@ -1113,6 +1139,8 @@ const boot = [
   }
   log('READY — SPACE 눌러 말하기 또는 WAKE ON 후 "자비스" 부르기');
   updateWakeUI();
+  updateGptUI();
+  if (gptMode) log("GPT MODE ON — 모든 답변 OpenAI 합성");
 })();
 </script>
 </body>
