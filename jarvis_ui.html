@@ -748,61 +748,74 @@ function stopWakeListener() {
 
 const QUESTION_WINDOW_MS = 12000;
 
-function captureQuestionAfterWake() {
+async function captureQuestionAfterWake() {
   if (questionRecognition) return;
-  setState(STATE.LISTENING);
-  const q = new SR();
-  q.lang = "ko-KR";
-  q.continuous = true;
-  q.interimResults = true;
-  q.maxAlternatives = 1;
-  let live = log("LISTENING...", "live");
-  let final = "";
-  let resolved = false;
-  const stopAndDispatch = () => {
-    if (resolved) return;
-    resolved = true;
-    clearTimeout(timer);
-    try { q.abort(); } catch {}
-    questionRecognition = null;
-    if (final && final.length >= 2) {
-      handleQuery(final);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      log("LISTENING RETRY " + attempt + "/2");
+      await new Promise(r => setTimeout(r, 500));
+    }
+    const r = await _captureQuestionOnce();
+    if (r.netError && wakeMode) continue;
+    if (r.text && r.text.length >= 2) {
+      handleQuery(r.text);
     } else {
       log("(빈 음성, 대기 모드 복귀)");
       setState(STATE.IDLE);
       if (wakeMode) startWakeListener();
     }
-  };
-  const timer = setTimeout(stopAndDispatch, QUESTION_WINDOW_MS);
-  q.onresult = (ev) => {
-    let f = "", interim = "";
-    for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const t = ev.results[i][0].transcript || "";
-      if (ev.results[i].isFinal) f += t;
-      else interim += t;
-    }
-    if (live) live.textContent = "LISTENING: " + (f || interim);
-    if (f.trim()) {
-      final = f.trim();
-      stopAndDispatch();
-    }
-  };
-  q.onerror = (ev) => {
-    if (ev.error !== "no-speech" && ev.error !== "aborted") {
-      log("STT ERROR: " + ev.error, "error");
-    }
-  };
-  q.onend = () => {
-    if (!resolved) stopAndDispatch();
-  };
-  try {
-    q.start();
-    questionRecognition = q;
-  } catch (e) {
-    log("question STT start failed: " + e.message, "error");
-    setState(STATE.IDLE);
-    if (wakeMode) startWakeListener();
+    return;
   }
+  setState(STATE.IDLE);
+  if (wakeMode) startWakeListener();
+}
+
+function _captureQuestionOnce() {
+  return new Promise((resolve) => {
+    setState(STATE.LISTENING);
+    const q = new SR();
+    q.lang = "ko-KR";
+    q.continuous = true;
+    q.interimResults = true;
+    q.maxAlternatives = 1;
+    const live = log("LISTENING...", "live");
+    let final = "";
+    let resolved = false;
+    let netError = false;
+    const stop = () => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try { q.abort(); } catch {}
+      questionRecognition = null;
+      resolve({ text: final, netError });
+    };
+    const timer = setTimeout(stop, QUESTION_WINDOW_MS);
+    q.onresult = (ev) => {
+      let f = "", interim = "";
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const t = ev.results[i][0].transcript || "";
+        if (ev.results[i].isFinal) f += t;
+        else interim += t;
+      }
+      if (live) live.textContent = "LISTENING: " + (f || interim);
+      if (f.trim()) { final = f.trim(); stop(); }
+    };
+    q.onerror = (ev) => {
+      if (ev.error === "network") netError = true;
+      else if (ev.error !== "no-speech" && ev.error !== "aborted") {
+        log("STT ERROR: " + ev.error, "error");
+      }
+    };
+    q.onend = () => { if (!resolved) stop(); };
+    try {
+      q.start();
+      questionRecognition = q;
+    } catch (e) {
+      log("question STT start failed: " + e.message, "error");
+      stop();
+    }
+  });
 }
 
 function updateWakeUI() {
@@ -825,13 +838,30 @@ function abortFollowup() {
   }
 }
 
-function captureFollowupText() {
+async function captureFollowupText() {
+  if (!SR || !wakeMode) return null;
+  // Cool-down so Chrome releases mic resources from the just-finished TTS
+  // playback. Without this, the next SR.start() often fails with "network".
+  await new Promise(r => setTimeout(r, 600));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (!wakeMode) return null;
+    if (attempt > 0) {
+      log("FOLLOWUP RETRY " + attempt + "/2");
+      await new Promise(r => setTimeout(r, 500));
+    }
+    const r = await _captureFollowupOnce(attempt === 0);
+    if (r.netError && wakeMode) continue;
+    return r.text;
+  }
+  return null;
+}
+
+function _captureFollowupOnce(announce) {
   return new Promise((resolve) => {
-    if (!SR || !wakeMode) { resolve(null); return; }
     followupAbort = false;
     setState(STATE.LISTENING);
-    playFollowupBeep();
-    const live = log("FOLLOWUP — 듣고 있어요", "live");
+    if (announce) playFollowupBeep();
+    const live = log(announce ? "FOLLOWUP — 듣고 있어요" : "FOLLOWUP (재시도)", "live");
     const q = new SR();
     q.lang = "ko-KR";
     q.continuous = true;
@@ -839,17 +869,16 @@ function captureFollowupText() {
     q.maxAlternatives = 1;
     let final = "";
     let resolved = false;
+    let netError = false;
     const finish = (text) => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timer);
       try { q.abort(); } catch {}
       followupRecognition = null;
-      resolve(text);
+      resolve({ text, netError });
     };
-    const timer = setTimeout(() => {
-      finish(null);
-    }, FOLLOWUP_WINDOW_MS);
+    const timer = setTimeout(() => finish(null), FOLLOWUP_WINDOW_MS);
     q.onresult = (ev) => {
       let f = "", interim = "";
       for (let i = ev.resultIndex; i < ev.results.length; i++) {
@@ -858,13 +887,12 @@ function captureFollowupText() {
         else interim += t;
       }
       if (live) live.textContent = "FOLLOWUP: " + (f || interim);
-      if (f.trim()) {
-        final = f.trim();
-        finish(final);
-      }
+      if (f.trim()) { final = f.trim(); finish(final); }
     };
     q.onerror = (ev) => {
-      if (ev.error !== "no-speech" && ev.error !== "aborted") {
+      if (ev.error === "network") {
+        netError = true;
+      } else if (ev.error !== "no-speech" && ev.error !== "aborted") {
         log("FOLLOWUP STT ERROR: " + ev.error, "error");
       }
     };
