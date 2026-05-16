@@ -1241,6 +1241,7 @@ const boot = [
     log(line);
     await new Promise(r => setTimeout(r, 120));
   }
+  log("STT BACKEND: faster-whisper via /api/stt (no cloud)");
   log('READY — SPACE 눌러 말하기 또는 WAKE ON 후 "자비스" 부르기');
   updateWakeUI();
   updateGptUI();

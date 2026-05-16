@@ -681,7 +681,17 @@ async def web_search(query: str) -> str:
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(HTML, media_type="text/html; charset=utf-8")
+    # During active development we serve the HTML with cache disabled so
+    # the browser never holds onto a stale version after a code change.
+    return FileResponse(
+        HTML,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 def _ndjson(obj: dict) -> bytes:
