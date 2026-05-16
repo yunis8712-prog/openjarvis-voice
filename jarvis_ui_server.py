@@ -422,6 +422,166 @@ async def fetch_lotto_for(text: str) -> tuple[str, str]:
     return str(rnd or ""), summary
 
 
+# ── Weather (Open-Meteo) ───────────────────────────────────────────────
+WEATHER_KEYWORDS = (
+    "날씨", "기온", "기상", "예보", "강수", "강우", "강설",
+    "비 와", "비가 ", "비 올", "비 안", "눈 와", "눈이 ", "눈 안",
+    "우산", "체감온도", "체감 온도", "미세먼지", "황사",
+)
+
+KNOWN_CITIES: dict[str, tuple[float, float]] = {
+    "서울": (37.5665, 126.9780),
+    "부산": (35.1796, 129.0756),
+    "인천": (37.4563, 126.7052),
+    "대구": (35.8714, 128.6014),
+    "대전": (36.3504, 127.3845),
+    "광주": (35.1595, 126.8526),
+    "울산": (35.5384, 129.3114),
+    "세종": (36.4801, 127.2890),
+    "제주": (33.4996, 126.5312),
+    "수원": (37.2636, 127.0286),
+    "고양": (37.6584, 126.8320),
+    "성남": (37.4200, 127.1267),
+    "용인": (37.2411, 127.1776),
+    "안양": (37.3943, 126.9568),
+    "춘천": (37.8813, 127.7298),
+    "강릉": (37.7519, 128.8761),
+    "전주": (35.8242, 127.1480),
+    "여수": (34.7604, 127.6622),
+    "포항": (36.0190, 129.3435),
+    "원주": (37.3422, 127.9202),
+    "청주": (36.6424, 127.4890),
+    "천안": (36.8151, 127.1139),
+    "목포": (34.8118, 126.3923),
+    "창원": (35.2280, 128.6810),
+    "안산": (37.3219, 126.8309),
+    "평택": (36.9921, 127.1129),
+}
+DEFAULT_WEATHER_CITY = ("서울", 37.5665, 126.9780)
+
+# WMO weather codes → 한국어 묘사
+_WMO_KO: dict[int, str] = {
+    0: "맑음", 1: "대체로 맑음", 2: "가끔 구름", 3: "흐림",
+    45: "안개", 48: "서리 안개",
+    51: "약한 이슬비", 53: "이슬비", 55: "강한 이슬비",
+    56: "어는 이슬비", 57: "어는 강한 이슬비",
+    61: "약한 비", 63: "비", 65: "강한 비",
+    66: "어는 비", 67: "어는 강한 비",
+    71: "약한 눈", 73: "눈", 75: "강한 눈", 77: "진눈깨비",
+    80: "약한 소나기", 81: "소나기", 82: "강한 소나기",
+    85: "약한 눈 소나기", 86: "강한 눈 소나기",
+    95: "천둥번개", 96: "우박과 천둥번개", 99: "강한 우박과 천둥번개",
+}
+
+
+def needs_weather(text: str) -> bool:
+    if not text:
+        return False
+    t = text.replace(" ", "").lower()
+    return any(k.replace(" ", "").lower() in t for k in WEATHER_KEYWORDS)
+
+
+def _extract_city(text: str) -> tuple[str, float, float]:
+    for name, (lat, lon) in KNOWN_CITIES.items():
+        if name in text:
+            return name, lat, lon
+    return DEFAULT_WEATHER_CITY
+
+
+async def _geocode(client: httpx.AsyncClient, name: str) -> tuple[float, float] | None:
+    try:
+        r = await client.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": name, "count": 1, "language": "ko", "format": "json"},
+        )
+        if r.status_code != 200:
+            return None
+        results = (r.json().get("results") or [])
+        if not results:
+            return None
+        return float(results[0]["latitude"]), float(results[0]["longitude"])
+    except Exception:
+        return None
+
+
+async def fetch_weather_for(text: str) -> tuple[str, str]:
+    """Returns (city_name, summary)."""
+    city, lat, lon = _extract_city(text)
+    days = 1
+    if "모레" in text:
+        days = 3
+    elif "내일" in text:
+        days = 2
+    elif "이번 주" in text or "이번주" in text or "주말" in text:
+        days = 7
+
+    timeout = httpx.Timeout(connect=3.0, read=8.0, write=3.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            r = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "current": "temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,apparent_temperature",
+                    "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,weather_code",
+                    "timezone": "Asia/Seoul",
+                    "forecast_days": days,
+                },
+            )
+        except Exception as exc:
+            return city, f"(날씨 조회 실패: {exc})"
+        if r.status_code != 200:
+            return city, f"(날씨 API {r.status_code})"
+        data = r.json()
+
+    current = data.get("current") or {}
+    daily = data.get("daily") or {}
+    parts = [f"{city} 날씨 (Open-Meteo)"]
+
+    if current:
+        temp = current.get("temperature_2m")
+        feels = current.get("apparent_temperature")
+        code = current.get("weather_code")
+        humidity = current.get("relative_humidity_2m")
+        wind = current.get("wind_speed_10m")
+        precip = current.get("precipitation")
+        cond = _WMO_KO.get(code, "")
+        bits = [f"현재 기온 {temp}도"]
+        if feels is not None and feels != temp:
+            bits.append(f"체감 {feels}도")
+        if cond:
+            bits.append(cond)
+        if humidity:
+            bits.append(f"습도 {humidity}%")
+        if precip is not None and precip > 0:
+            bits.append(f"강수 {precip}mm")
+        if wind:
+            bits.append(f"바람 {wind} km/h")
+        parts.append(", ".join(bits) + ".")
+
+    if daily.get("time"):
+        labels = ["오늘", "내일", "모레", "글피", "그글피", "+5일", "+6일"]
+        for i, day in enumerate(daily["time"]):
+            label = labels[i] if i < len(labels) else day
+            tmax = daily["temperature_2m_max"][i]
+            tmin = daily["temperature_2m_min"][i]
+            psum = daily["precipitation_sum"][i]
+            pprob = (daily.get("precipitation_probability_max") or [None] * (i + 1))[i]
+            code = daily["weather_code"][i]
+            cond = _WMO_KO.get(code, "")
+            bits = [f"{label} 최고 {tmax}도", f"최저 {tmin}도"]
+            if cond:
+                bits.append(cond)
+            if pprob is not None and pprob > 0:
+                bits.append(f"강수확률 {pprob}%")
+            if psum and psum > 0:
+                bits.append(f"강수량 {psum}mm")
+            parts.append(", ".join(bits) + ".")
+
+    return city, "\n".join(parts)
+
+
 # ── Running / Marathon ─────────────────────────────────────────────────
 RUNNING_KEYWORDS = (
     "러닝", "달리기", "조깅", "마라톤", "풀코스", "하프코스", "하프 코스",
@@ -742,7 +902,19 @@ async def chat(req: Request) -> StreamingResponse:
         if last_user and is_social_chat(last_user):
             yield _ndjson({"_progress": "SOCIAL CHAT"})
         elif search_enabled and last_user:
-            if needs_kbo(last_user):
+            if needs_weather(last_user):
+                yield _ndjson({"_progress": "WEATHER (Open-Meteo)"})
+                city, summary = await fetch_weather_for(last_user)
+                lines = summary.splitlines()
+                preview = lines[1][:80] if len(lines) > 1 else summary[:80]
+                yield _ndjson({"_progress": f"WEATHER {city}: {preview}"})
+                injected = (
+                    f"다음은 {city}의 Open-Meteo 공식 날씨 데이터입니다. "
+                    "이 데이터만 근거로 사용자 질문에 답하세요. "
+                    "마크다운 없이 한 단락 두 문장 이내. 기온/날씨/강수 같은 핵심 수치 한두 개만 자연스럽게.",
+                    summary,
+                )
+            elif needs_kbo(last_user):
                 yield _ndjson({"_progress": "KBO SCHEDULE LOOKUP"})
                 date_str, summary = await fetch_kbo_for(last_user)
                 yield _ndjson({"_progress": f"KBO {date_str}: {summary.splitlines()[0][:80]}"})
