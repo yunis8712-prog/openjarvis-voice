@@ -477,88 +477,197 @@ function updateStats() {
 setInterval(updateStats, 800);
 updateStats();
 
-// ============ STT (webkitSpeechRecognition) ============
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let recognition = null;
+// ============ STT — MediaRecorder + backend faster-whisper ============
+// All STT now goes through /api/stt (GPU faster-whisper) instead of
+// Chrome's flaky webkitSpeechRecognition. Same mic stream is reused so
+// the browser doesn't re-prompt for permission on every recording.
 let micGranted = false;
+let _micStream = null;
 
-function setupRecognition() {
-  if (!SR) {
-    log("SPEECH RECOGNITION UNSUPPORTED — Chrome 권장", "error");
-    elMic.textContent = "N/A";
-    return null;
+async function getMic() {
+  if (_micStream && _micStream.active) return _micStream;
+  _micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    }
+  });
+  if (!micGranted) {
+    micGranted = true;
+    log("MIC PERMISSION GRANTED");
+    elMic.textContent = "ON";
   }
-  const r = new SR();
-  r.lang = "ko-KR";
-  r.continuous = false;
-  r.interimResults = true;
-  r.maxAlternatives = 1;
-
-  let interim = "";
-  let liveLogLi = null;
-
-  r.onstart = () => {
-    interim = "";
-    liveLogLi = log("LISTENING...", "live");
-    setState(STATE.LISTENING);
-    if (!micGranted) {
-      micGranted = true;
-      log("MIC PERMISSION GRANTED");
-      elMic.textContent = "ON";
-    }
-  };
-  r.onresult = (ev) => {
-    interim = "";
-    let final = "";
-    for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const t = ev.results[i][0].transcript;
-      if (ev.results[i].isFinal) final += t;
-      else interim += t;
-    }
-    if (liveLogLi) liveLogLi.textContent = "LISTENING: " + (final || interim);
-    if (final.trim()) {
-      handleQuery(final.trim());
-    }
-  };
-  r.onerror = (ev) => {
-    // 'no-speech' just means the user didn't say anything within the
-    // recognition window — that's expected and not actionable, so we
-    // skip it from the user-facing log to keep things quiet.
-    if (ev.error !== "no-speech" && ev.error !== "aborted") {
-      log("STT ERROR: " + ev.error, "error");
-    }
-    if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
-      elMic.textContent = "DENIED";
-    }
-    if (state === STATE.LISTENING) setState(STATE.IDLE);
-  };
-  r.onend = () => {
-    if (state === STATE.LISTENING) {
-      // No final result captured
-      setState(STATE.IDLE);
-    }
-    // If the user is in wake-word mode, the wake listener takes the mic
-    // back as soon as the manual recognition releases it.
-    if (wakeMode && state === STATE.IDLE) startWakeListener();
-  };
-  return r;
+  return _micStream;
 }
-recognition = setupRecognition();
 
-function startListening() {
-  if (!recognition) return;
+function _bestMime() {
+  const c = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  for (const m of c) if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+  return "";
+}
+
+async function transcribeBlob(blob) {
+  if (!blob || blob.size < 1500) return "";
+  const r = await fetch("/api/stt", {
+    method: "POST",
+    headers: { "Content-Type": blob.type || "audio/webm" },
+    body: blob,
+  });
+  if (!r.ok) throw new Error("stt " + r.status);
+  const j = await r.json();
+  return (j.text || "").trim();
+}
+
+/**
+ * Record audio with voice activity detection. Opens mic, waits up to
+ * `maxWaitMs` for the user to start speaking. Once speech is detected,
+ * keeps recording until `silenceMs` of silence follows (or `maxSpeechMs`).
+ * Returns the recorded Blob (or null if nothing was said).
+ */
+async function recordWithVAD(opts = {}) {
+  const maxWaitMs = opts.maxWaitMs ?? 10000;
+  const maxSpeechMs = opts.maxSpeechMs ?? 12000;
+  const silenceMs = opts.silenceMs ?? 1000;
+  const minSpeechMs = opts.minSpeechMs ?? 250;
+  const threshold = opts.threshold ?? 18;
+  const onInterim = opts.onInterim;  // optional callback(elapsedMs, isSpeaking)
+
+  const stream = await getMic();
+  const ctx = _ctx();
+  const source = ctx.createMediaStreamSource(stream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  analyser.smoothingTimeConstant = 0.4;
+  source.connect(analyser);
+  const data = new Uint8Array(analyser.frequencyBinCount);
+
+  const mime = _bestMime();
+  const mr = mime ? new MediaRecorder(stream, { mimeType: mime })
+                  : new MediaRecorder(stream);
+  const chunks = [];
+  mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+  const stopped = new Promise(r => mr.onstop = r);
+  mr.start(100);
+
+  const startWait = Date.now();
+  let speechStart = 0;
+  let lastVoiceAt = 0;
+  let aborted = false;
+  recordWithVAD._abort = () => { aborted = true; };
+
+  await new Promise((resolve) => {
+    const tick = setInterval(() => {
+      analyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i];
+      const avg = sum / data.length;
+      const now = Date.now();
+      if (avg > threshold) {
+        if (!speechStart) speechStart = now;
+        lastVoiceAt = now;
+      }
+      if (onInterim) onInterim(now - startWait, !!speechStart);
+      const elapsed = now - startWait;
+      if (aborted) { clearInterval(tick); resolve(); return; }
+      if (!speechStart && elapsed > maxWaitMs) { clearInterval(tick); resolve(); return; }
+      if (speechStart) {
+        const speechDur = now - speechStart;
+        const sinceVoice = now - lastVoiceAt;
+        if (speechDur > minSpeechMs && sinceVoice > silenceMs) {
+          clearInterval(tick); resolve(); return;
+        }
+        if (speechDur > maxSpeechMs) { clearInterval(tick); resolve(); return; }
+      }
+    }, 50);
+  });
+
+  if (mr.state === "recording") mr.stop();
+  await stopped;
+  try { source.disconnect(); } catch {}
+  if (aborted || !speechStart) return null;
+  return new Blob(chunks, { type: mime || "audio/webm" });
+}
+
+/**
+ * Open mic and record until the returned stop() is called. No VAD —
+ * for push-to-talk where the user controls start and end.
+ */
+async function recordManual(opts = {}) {
+  const maxMs = opts.maxMs ?? 30000;
+  const stream = await getMic();
+  const mime = _bestMime();
+  const mr = mime ? new MediaRecorder(stream, { mimeType: mime })
+                  : new MediaRecorder(stream);
+  const chunks = [];
+  mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+  const stopped = new Promise(r => mr.onstop = r);
+  mr.start();
+  const timer = setTimeout(() => { if (mr.state === "recording") mr.stop(); }, maxMs);
+  return {
+    stop: async () => {
+      clearTimeout(timer);
+      if (mr.state === "recording") mr.stop();
+      await stopped;
+      return new Blob(chunks, { type: mime || "audio/webm" });
+    },
+    cancel: () => {
+      clearTimeout(timer);
+      if (mr.state === "recording") mr.stop();
+    },
+  };
+}
+
+// ============ STT (legacy SR removed; kept handle for compat) ============
+const SR = null;  // intentionally null — code path now uses MediaRecorder
+let recognition = null;
+
+// Push-to-talk: Space starts, Space stops. Uses backend STT.
+let pushToTalkRec = null;
+let pushToTalkLive = null;
+
+async function startListening() {
   if (state !== STATE.IDLE) return;
+  if (!window.MediaRecorder) {
+    log("MediaRecorder UNSUPPORTED — 최신 Chrome/Edge 사용", "error");
+    return;
+  }
+  cancelSpeak();
+  stopWakeListener();
+  setState(STATE.LISTENING);
+  pushToTalkLive = log("LISTENING (Space로 종료)", "live");
   try {
-    cancelSpeak();
-    recognition.start();
+    pushToTalkRec = await recordManual({ maxMs: 30000 });
   } catch (e) {
-    log("STT start failed: " + e.message, "error");
+    log("MIC ERROR: " + e.message, "error");
+    setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
   }
 }
-function stopListening() {
-  if (!recognition) return;
-  if (state === STATE.LISTENING) {
-    try { recognition.stop(); } catch {}
+
+async function stopListening() {
+  if (!pushToTalkRec) return;
+  const rec = pushToTalkRec;
+  pushToTalkRec = null;
+  const blob = await rec.stop();
+  if (pushToTalkLive) pushToTalkLive.textContent = "📝 받아쓰기...";
+  let text;
+  try {
+    text = await transcribeBlob(blob);
+  } catch (e) {
+    log("STT ERROR: " + e.message, "error");
+    setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
+    return;
+  }
+  if (text && text.length >= 2) {
+    if (pushToTalkLive) pushToTalkLive.textContent = "QUERY: " + text;
+    handleQuery(text);
+  } else {
+    if (pushToTalkLive) pushToTalkLive.textContent = "(빈 음성)";
+    setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
   }
 }
 
@@ -650,172 +759,120 @@ function playFollowupBeep() {
   } catch {}
 }
 
-let wakeInterimLi = null;  // re-used <li> for live interim transcript
+let wakeInterimLi = null;  // re-used <li> for live wake transcripts
+let wakeLoopActive = false;
+let wakeAbortRequested = false;
 
-function startWakeListener() {
-  if (!SR || !wakeMode) return;
-  if (wakeRecognition) return;
+async function startWakeListener() {
+  if (!wakeMode || wakeLoopActive) return;
   if (state !== STATE.IDLE) return;
-  const r = new SR();
-  r.lang = "ko-KR";
-  r.continuous = true;
-  r.interimResults = true;
-  r.maxAlternatives = 1;
+  if (!window.MediaRecorder) {
+    log("MediaRecorder UNSUPPORTED — 최신 Chrome/Edge 사용", "error");
+    return;
+  }
+  wakeLoopActive = true;
+  wakeAbortRequested = false;
+  log('WAKE LISTENER ACTIVE — "자비스" 부르기', "live");
 
-  r.onstart = () => {
-    if (!micGranted) {
-      micGranted = true;
-      log("MIC PERMISSION GRANTED");
-      elMic.textContent = "ON";
+  while (wakeMode && !wakeAbortRequested && state === STATE.IDLE) {
+    let blob;
+    try {
+      // Wait up to 30s for speech; once detected, capture until silence.
+      blob = await recordWithVAD({ maxWaitMs: 30000, maxSpeechMs: 5000, silenceMs: 700, minSpeechMs: 200 });
+    } catch (e) {
+      log("MIC ERROR: " + e.message, "error");
+      break;
     }
-    log('WAKE LISTENER ACTIVE — "자비스" 부르기', "live");
-    wakeInterimLi = null;
-  };
-  r.onresult = (ev) => {
-    // Process interim results too — wake fires as soon as the wake word is
-    // visible at the start of the current hypothesis, instead of waiting
-    // for the recognition session to settle. Debounce protects against
-    // double-fire when the same hypothesis later becomes final.
-    for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const t = ev.results[i][0].transcript || "";
-      const isFinal = ev.results[i].isFinal;
-      // Live diagnostic: show what STT is hearing in real time so the
-      // user can see if "자비스" is being transcribed correctly.
-      if (t.trim()) {
-        if (!wakeInterimLi) wakeInterimLi = log("들리는 중: " + t, "live");
-        else wakeInterimLi.textContent = "들리는 중: " + t;
-      }
-      const m = detectWakeWord(t);
-      if (!m) {
-        if (isFinal && t.trim()) {
-          log("못 알아들음: " + t.trim().slice(0, 40));
-          wakeInterimLi = null;
-        }
-        continue;
-      }
-      const now = Date.now();
-      if (now - lastWakeFireAt < WAKE_DEBOUNCE_MS) return;
-      lastWakeFireAt = now;
-      const after = m.after;
+    if (wakeAbortRequested || !wakeMode || state !== STATE.IDLE) break;
+    if (!blob) continue;  // no speech in window — loop and keep listening
+    let text;
+    try {
+      text = await transcribeBlob(blob);
+    } catch (e) {
+      // backend hiccup — don't spam logs, just retry next cycle
+      continue;
+    }
+    if (text) {
+      if (!wakeInterimLi) wakeInterimLi = log("들리는 중: " + text, "live");
+      else wakeInterimLi.textContent = "들리는 중: " + text;
+    }
+    const m = text ? detectWakeWord(text) : null;
+    if (!m) {
+      if (text) log("못 알아들음: " + text.slice(0, 40));
       wakeInterimLi = null;
-      try { r.abort(); } catch {}
-      playWakeBeep();
-      if (after.length >= 2) {
-        log("WAKE: " + t.trim(), "live");
-        handleQuery(after);
-      } else {
-        log("WAKE — 듣고 있어요", "live");
-        captureQuestionAfterWake();
-      }
-      return;
+      continue;
     }
-  };
-  r.onerror = (ev) => {
-    if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
-      log("WAKE LISTEN BLOCKED: " + ev.error, "error");
-      elMic.textContent = "DENIED";
-      wakeMode = false;
-      updateWakeUI();
-    } else if (ev.error === "network") {
-      log("WAKE NETWORK ERROR — 인터넷 확인 필요", "error");
-    }
-    // 'no-speech' / 'audio-capture' / 'aborted' are normal — let onend restart
-  };
-  r.onend = () => {
-    wakeRecognition = null;
+    // Wake fired
+    const now = Date.now();
+    if (now - lastWakeFireAt < WAKE_DEBOUNCE_MS) { wakeInterimLi = null; continue; }
+    lastWakeFireAt = now;
     wakeInterimLi = null;
-    // Auto-restart while in wake mode and idle (Chrome stops continuous SR
-    // periodically; the loop keeps the wake word always-on).
-    if (wakeMode && state === STATE.IDLE) {
-      setTimeout(startWakeListener, 250);
-    }
-  };
-  try {
-    r.start();
-    wakeRecognition = r;
-  } catch (e) {
-    // start() throws if another recognition is already running
-    log("wake start failed: " + e.message, "error");
-  }
-}
-
-function stopWakeListener() {
-  if (wakeRecognition) {
-    try { wakeRecognition.abort(); } catch {}
-    wakeRecognition = null;
-  }
-}
-
-const QUESTION_WINDOW_MS = 12000;
-
-async function captureQuestionAfterWake() {
-  if (questionRecognition) return;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) {
-      log("LISTENING RETRY " + attempt + "/2");
-      await new Promise(r => setTimeout(r, 500));
-    }
-    const r = await _captureQuestionOnce();
-    if (r.netError && wakeMode) continue;
-    if (r.text && r.text.length >= 2) {
-      handleQuery(r.text);
+    wakeLoopActive = false;
+    playWakeBeep();
+    if (m.after.length >= 2) {
+      log("WAKE: " + text, "live");
+      handleQuery(m.after);
     } else {
-      log("(빈 음성, 대기 모드 복귀)");
-      setState(STATE.IDLE);
-      if (wakeMode) startWakeListener();
+      log("WAKE — 듣고 있어요", "live");
+      captureQuestionAfterWake();
     }
     return;
   }
-  setState(STATE.IDLE);
-  if (wakeMode) startWakeListener();
+  wakeLoopActive = false;
+  wakeInterimLi = null;
 }
 
-function _captureQuestionOnce() {
-  return new Promise((resolve) => {
-    setState(STATE.LISTENING);
-    const q = new SR();
-    q.lang = "ko-KR";
-    q.continuous = true;
-    q.interimResults = true;
-    q.maxAlternatives = 1;
-    const live = log("LISTENING...", "live");
-    let final = "";
-    let resolved = false;
-    let netError = false;
-    const stop = () => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      try { q.abort(); } catch {}
-      questionRecognition = null;
-      resolve({ text: final, netError });
-    };
-    const timer = setTimeout(stop, QUESTION_WINDOW_MS);
-    q.onresult = (ev) => {
-      let f = "", interim = "";
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const t = ev.results[i][0].transcript || "";
-        if (ev.results[i].isFinal) f += t;
-        else interim += t;
-      }
-      if (live) live.textContent = "LISTENING: " + (f || interim);
-      if (f.trim()) { final = f.trim(); stop(); }
-    };
-    q.onerror = (ev) => {
-      if (ev.error === "network") netError = true;
-      else if (ev.error !== "no-speech" && ev.error !== "aborted") {
-        log("STT ERROR: " + ev.error, "error");
-      }
-    };
-    q.onend = () => { if (!resolved) stop(); };
-    try {
-      q.start();
-      questionRecognition = q;
-    } catch (e) {
-      log("question STT start failed: " + e.message, "error");
-      stop();
-    }
-  });
+function stopWakeListener() {
+  wakeAbortRequested = true;
+  if (recordWithVAD._abort) recordWithVAD._abort();
+}
+
+async function captureQuestionAfterWake() {
+  setState(STATE.LISTENING);
+  const live = log("LISTENING...", "live");
+  let blob;
+  try {
+    blob = await recordWithVAD({
+      maxWaitMs: 7000,
+      maxSpeechMs: 12000,
+      silenceMs: 1100,
+      minSpeechMs: 250,
+      onInterim: (ms, isSpeaking) => {
+        if (live) live.textContent = isSpeaking
+          ? "LISTENING (말하는 중)..."
+          : `LISTENING... (${(ms/1000).toFixed(1)}s)`;
+      },
+    });
+  } catch (e) {
+    log("MIC ERROR: " + e.message, "error");
+    setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
+    return;
+  }
+  if (!blob) {
+    if (live) live.textContent = "(빈 음성, 대기 모드 복귀)";
+    setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
+    return;
+  }
+  if (live) live.textContent = "📝 받아쓰기...";
+  let text;
+  try {
+    text = await transcribeBlob(blob);
+  } catch (e) {
+    log("STT ERROR: " + e.message, "error");
+    setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
+    return;
+  }
+  if (text && text.length >= 2) {
+    if (live) live.textContent = "QUERY: " + text;
+    handleQuery(text);
+  } else {
+    if (live) live.textContent = "(빈 음성)";
+    setState(STATE.IDLE);
+    if (wakeMode) startWakeListener();
+  }
 }
 
 function updateWakeUI() {
@@ -832,82 +889,46 @@ let followupAbort = false;
 
 function abortFollowup() {
   followupAbort = true;
-  if (followupRecognition) {
-    try { followupRecognition.abort(); } catch {}
-    followupRecognition = null;
-  }
+  if (recordWithVAD._abort) recordWithVAD._abort();
 }
 
 async function captureFollowupText() {
-  if (!SR || !wakeMode) return null;
-  // Cool-down so Chrome releases mic resources from the just-finished TTS
-  // playback. Without this, the next SR.start() often fails with "network".
-  await new Promise(r => setTimeout(r, 600));
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (!wakeMode) return null;
-    if (attempt > 0) {
-      log("FOLLOWUP RETRY " + attempt + "/2");
-      await new Promise(r => setTimeout(r, 500));
-    }
-    const r = await _captureFollowupOnce(attempt === 0);
-    if (r.netError && wakeMode) continue;
-    return r.text;
+  if (!wakeMode) return null;
+  // Cool-down so the TTS Audio element releases the audio thread before
+  // we open a new MediaRecorder session.
+  await new Promise(r => setTimeout(r, 400));
+  followupAbort = false;
+  setState(STATE.LISTENING);
+  playFollowupBeep();
+  const live = log("FOLLOWUP — 듣고 있어요", "live");
+  let blob;
+  try {
+    blob = await recordWithVAD({
+      maxWaitMs: FOLLOWUP_WINDOW_MS,
+      maxSpeechMs: 12000,
+      silenceMs: 1100,
+      minSpeechMs: 250,
+      onInterim: (ms, isSpeaking) => {
+        if (followupAbort) return;
+        if (live) live.textContent = isSpeaking
+          ? "FOLLOWUP (말하는 중)..."
+          : `FOLLOWUP... (${(ms/1000).toFixed(1)}s)`;
+      },
+    });
+  } catch (e) {
+    log("MIC ERROR: " + e.message, "error");
+    return null;
   }
-  return null;
-}
-
-function _captureFollowupOnce(announce) {
-  return new Promise((resolve) => {
-    followupAbort = false;
-    setState(STATE.LISTENING);
-    if (announce) playFollowupBeep();
-    const live = log(announce ? "FOLLOWUP — 듣고 있어요" : "FOLLOWUP (재시도)", "live");
-    const q = new SR();
-    q.lang = "ko-KR";
-    q.continuous = true;
-    q.interimResults = true;
-    q.maxAlternatives = 1;
-    let final = "";
-    let resolved = false;
-    let netError = false;
-    const finish = (text) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      try { q.abort(); } catch {}
-      followupRecognition = null;
-      resolve({ text, netError });
-    };
-    const timer = setTimeout(() => finish(null), FOLLOWUP_WINDOW_MS);
-    q.onresult = (ev) => {
-      let f = "", interim = "";
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const t = ev.results[i][0].transcript || "";
-        if (ev.results[i].isFinal) f += t;
-        else interim += t;
-      }
-      if (live) live.textContent = "FOLLOWUP: " + (f || interim);
-      if (f.trim()) { final = f.trim(); finish(final); }
-    };
-    q.onerror = (ev) => {
-      if (ev.error === "network") {
-        netError = true;
-      } else if (ev.error !== "no-speech" && ev.error !== "aborted") {
-        log("FOLLOWUP STT ERROR: " + ev.error, "error");
-      }
-    };
-    q.onend = () => {
-      if (followupAbort) finish(null);
-      else finish(final && final.length >= 2 ? final : null);
-    };
-    try {
-      q.start();
-      followupRecognition = q;
-    } catch (e) {
-      log("followup start failed: " + e.message, "error");
-      finish(null);
-    }
-  });
+  if (followupAbort || !blob) {
+    if (live) live.textContent = "(후속 없음)";
+    return null;
+  }
+  if (live) live.textContent = "📝 받아쓰기...";
+  let text;
+  try { text = await transcribeBlob(blob); }
+  catch (e) { log("STT ERROR: " + e.message, "error"); return null; }
+  if (live) live.textContent = text ? ("FOLLOWUP QUERY: " + text) : "(빈 음성)";
+  return (text && text.length >= 2) ? text : null;
 }
 
 // ============ TTS — edge-tts (Neural) via backend, browser fallback ============
@@ -1144,11 +1165,10 @@ document.addEventListener("keydown", (e) => {
     cancelSpeak();
     abortFollowup();
     if (state === STATE.LISTENING) {
-      stopListening();
-      if (questionRecognition) {
-        try { questionRecognition.abort(); } catch {}
-        questionRecognition = null;
-      }
+      if (pushToTalkRec) { pushToTalkRec.cancel(); pushToTalkRec = null; }
+      if (recordWithVAD._abort) recordWithVAD._abort();
+      setState(STATE.IDLE);
+      if (wakeMode) startWakeListener();
     } else if (state === STATE.SPEAKING) {
       setState(STATE.IDLE);
       hideReply();
@@ -1165,23 +1185,21 @@ document.getElementById("btnGpt").addEventListener("click", () => {
 });
 
 document.getElementById("btnWake").addEventListener("click", () => {
-  if (!SR) {
-    log("SR UNSUPPORTED — Chrome 권장", "error");
+  if (!window.MediaRecorder) {
+    log("MediaRecorder UNSUPPORTED — 최신 Chrome/Edge 사용", "error");
     return;
   }
   wakeMode = !wakeMode;
   updateWakeUI();
   if (wakeMode) {
     log('WAKE WORD MODE — "자비스" 라고 부르세요');
-    // If a push-to-talk session is mid-flight, stop it first; main
-    // recognition's onend will start the wake listener once the mic frees up.
     if (state === STATE.LISTENING) {
-      try { recognition && recognition.abort(); } catch {}
-    } else if (state === STATE.IDLE) {
-      startWakeListener();
+      // Cancel any open recording so the wake loop can take the mic.
+      if (pushToTalkRec) { pushToTalkRec.cancel(); pushToTalkRec = null; }
+      if (recordWithVAD._abort) recordWithVAD._abort();
+      setState(STATE.IDLE);
     }
-    // SPEAKING / THINKING: wake listener resumes naturally when state
-    // returns to IDLE via the existing handleQuery flow.
+    if (state === STATE.IDLE) startWakeListener();
   } else {
     log("WAKE WORD MODE OFF");
     stopWakeListener();

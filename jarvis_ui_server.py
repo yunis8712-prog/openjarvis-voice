@@ -8,6 +8,7 @@ restricted).
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import re
@@ -15,12 +16,42 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import edge_tts
-import httpx
-from ddgs import DDGS
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
-from lxml import html as lxml_html
+
+# ── Windows: register pip-installed nvidia DLLs BEFORE faster-whisper
+# imports ctranslate2. Same hold-the-cookie-alive trick as voice_chat.py.
+_DLL_COOKIES: list = []
+
+
+def _register_nvidia_dlls() -> None:
+    if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):
+        return
+    venv_lib = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia")
+    if not os.path.isdir(venv_lib):
+        return
+    extra = []
+    for sub in ("cublas", "cudnn", "cuda_nvrtc", "cuda_runtime"):
+        bin_dir = os.path.join(venv_lib, sub, "bin")
+        if os.path.isdir(bin_dir):
+            try:
+                _DLL_COOKIES.append(os.add_dll_directory(bin_dir))
+                extra.append(bin_dir)
+            except OSError:
+                pass
+    if extra:
+        os.environ["PATH"] = os.pathsep.join(extra) + os.pathsep + os.environ.get("PATH", "")
+
+
+_register_nvidia_dlls()
+
+
+import av  # noqa: E402  needed for /api/stt webm decode
+import edge_tts  # noqa: E402
+import httpx  # noqa: E402
+import numpy as np  # noqa: E402
+from ddgs import DDGS  # noqa: E402
+from fastapi import FastAPI, HTTPException, Request  # noqa: E402
+from fastapi.responses import FileResponse, Response, StreamingResponse  # noqa: E402
+from lxml import html as lxml_html  # noqa: E402
 
 ROOT = Path(__file__).parent.resolve()
 HTML = ROOT / "jarvis_ui.html"
@@ -866,6 +897,89 @@ async def chat(req: Request) -> StreamingResponse:
             yield _ndjson({"message": {"content": final}, "done": True})
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+_WHISPER_MODEL = None
+_WHISPER_LOCK = asyncio.Lock()
+WHISPER_SIZE = os.environ.get("JARVIS_WHISPER_SIZE", "small")
+WHISPER_ROOT = os.environ.get("JARVIS_WHISPER_ROOT", r"D:\Tools\whisper-models")
+
+
+def _load_whisper():
+    """Blocking load — must be called inside asyncio.to_thread()."""
+    from faster_whisper import WhisperModel
+
+    try:
+        return WhisperModel(
+            WHISPER_SIZE, device="cuda", compute_type="float16", download_root=WHISPER_ROOT
+        )
+    except Exception:
+        return WhisperModel(
+            WHISPER_SIZE, device="cpu", compute_type="int8", download_root=WHISPER_ROOT
+        )
+
+
+async def get_whisper():
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is not None:
+        return _WHISPER_MODEL
+    async with _WHISPER_LOCK:
+        if _WHISPER_MODEL is None:
+            _WHISPER_MODEL = await asyncio.to_thread(_load_whisper)
+    return _WHISPER_MODEL
+
+
+def _decode_audio_to_pcm(blob: bytes) -> np.ndarray:
+    """Decode webm/opus (or any PyAV-supported container) to mono float32 16k."""
+    container = av.open(io.BytesIO(blob))
+    try:
+        stream = next(s for s in container.streams if s.type == "audio")
+    except StopIteration:
+        container.close()
+        return np.zeros(0, dtype=np.float32)
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
+    parts = []
+    for frame in container.decode(stream):
+        for r in resampler.resample(frame):
+            parts.append(r.to_ndarray().reshape(-1))
+    for r in resampler.resample(None):
+        parts.append(r.to_ndarray().reshape(-1))
+    container.close()
+    if not parts:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(parts).astype(np.float32)
+
+
+def _transcribe_sync(model, audio: np.ndarray, language: str | None) -> tuple[str, float]:
+    segments, info = model.transcribe(
+        audio, language=language or "ko", beam_size=1, vad_filter=True
+    )
+    text = " ".join(s.text.strip() for s in segments).strip()
+    return text, float(getattr(info, "duration", 0.0) or 0.0)
+
+
+@app.post("/api/stt")
+async def stt(req: Request) -> Response:
+    """Transcribe an uploaded audio blob (webm/opus from MediaRecorder)."""
+    body = await req.body()
+    lang = req.query_params.get("lang") or "ko"
+    if not body:
+        return Response(content='{"text":"","duration":0}', media_type="application/json")
+    try:
+        audio = _decode_audio_to_pcm(body)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"audio decode failed: {exc}")
+    if audio.size < 4000:  # < 0.25 s — too short to meaningfully transcribe
+        return Response(content='{"text":"","duration":0}', media_type="application/json")
+    model = await get_whisper()
+    try:
+        text, duration = await asyncio.to_thread(_transcribe_sync, model, audio, lang)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"transcribe failed: {exc}")
+    return Response(
+        content=json.dumps({"text": text, "duration": duration}, ensure_ascii=False),
+        media_type="application/json",
+    )
 
 
 @app.post("/api/tts")
